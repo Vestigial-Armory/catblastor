@@ -98,24 +98,23 @@ def interpolate_zone(pan, tilt):
     return [list(v) for v in nearest["vertices"]]
 
 def get_interpolation_debug(pan, tilt):
-    """Return debug info about the interpolation at a given position."""
     pts = zone_cal["calibration_points"]
+    n_total_possible = int(((PAN_MAX-PAN_MIN)/GRID_STEP + 1) * ((TILT_MAX-TILT_MIN)/GRID_STEP + 1))
+    base = {"n_points": len(pts), "n_total_possible": n_total_possible,
+            "coverage_pct": round(len(pts)/n_total_possible*100, 1)}
     if not pts:
-        return {"method":"no_data","details":"No calibration points"}
+        return {**base, "method":"no_data","details":"No calibration points"}
     exact = next((p for p in pts
                   if abs(p["pan"]-pan)<0.5 and abs(p["tilt"]-tilt)<0.5), None)
     if exact:
-        return {"method":"exact","details":f"Exact match at pan={exact['pan']} tilt={exact['tilt']}"}
+        return {**base, "method":"exact","details":f"Exact match at pan={exact['pan']} tilt={exact['tilt']}"}
+    distances = [round(float(np.sqrt((pan-p["pan"])**2+(tilt-p["tilt"])**2)),1) for p in pts]
     if len(pts) >= 3:
-        distances = [round(np.sqrt((pan-p["pan"])**2+(tilt-p["tilt"])**2),1) for p in pts]
-        return {
-            "method":"linear_regression",
-            "n_points":len(pts),
-            "details":f"Linear fit from {len(pts)} points. Distances: {distances}",
-            "loocv":compute_calibration_strength()
-        }
-    distances = [round(np.sqrt((pan-p["pan"])**2+(tilt-p["tilt"])**2),1) for p in pts]
-    return {"method":"nearest_neighbor","details":f"Only {len(pts)} points, using nearest. Distances: {distances}"}
+        return {**base, "method":"linear_regression",
+                "details":f"Linear fit from {len(pts)} pts. Distances: {distances}",
+                "loocv":compute_calibration_strength()}
+    return {**base, "method":"nearest_neighbor",
+            "details":f"Only {len(pts)} pts — using nearest. Distances: {distances}"}
 
 def compute_calibration_strength():
     pts = zone_cal["calibration_points"]
@@ -247,8 +246,35 @@ def save_home_position():
 def clamp(val, lo, hi):
     return max(lo, min(hi, val))
 
+GRID_STEP = 5.0  # degrees per grid step
+last_grid_pos = {"pan": None, "tilt": None}
+
+def grid_snap(angle):
+    return round(round(angle / GRID_STEP) * GRID_STEP, 1)
+
+def auto_save_calibration_point():
+    """Auto-save zone at current grid position when in calibration phase."""
+    if state["setup_phase"] not in ("forced_L","forced_R","forced_up","forced_down","extra"):
+        return
+    gp = grid_snap(servo_angles["pan"])
+    gt = grid_snap(servo_angles["tilt"])
+    # Check if already saved at this grid position
+    existing = next((p for p in zone_cal["calibration_points"]
+                     if abs(p["pan"]-gp)<0.1 and abs(p["tilt"]-gt)<0.1), None)
+    if existing:
+        return  # already have this position, don't overwrite unless user drags
+    # Get zone — interpolated from existing points or fall back to home zone
+    zone, closed, _ = get_setup_zone()
+    if not zone or not closed:
+        return
+    zone_cal["calibration_points"].append({
+        "pan": gp, "tilt": gt,
+        "vertices": [list(v) for v in zone]
+    })
+    save_zone_cal()
+
 def move_servos(pan, tilt, slow=False):
-    global last_activity_time
+    global last_activity_time, last_grid_pos
     pan  = clamp(pan,  PAN_MIN,  PAN_MAX)
     tilt = clamp(tilt, TILT_MIN, TILT_MAX)
     if slow:
@@ -265,6 +291,13 @@ def move_servos(pan, tilt, slow=False):
         kit.servo[TILT_CH].angle = tilt
         servo_angles["pan"] = pan; servo_angles["tilt"] = tilt
     last_activity_time = time.time()
+    # Auto-save if we moved to a new grid position
+    gp = grid_snap(servo_angles["pan"])
+    gt = grid_snap(servo_angles["tilt"])
+    if gp != last_grid_pos["pan"] or gt != last_grid_pos["tilt"]:
+        last_grid_pos["pan"] = gp
+        last_grid_pos["tilt"] = gt
+        threading.Thread(target=auto_save_calibration_point, daemon=True).start()
 
 def servo_pct(angle, center, rang):
     return round((angle-center)/rang*100.0, 1)
@@ -519,6 +552,9 @@ def status():
     zone_px, z_closed = get_current_zone()
     setup_verts, setup_closed, is_exact = get_setup_zone()
     strength = compute_calibration_strength()
+    gp = grid_snap(servo_angles["pan"])
+    gt = grid_snap(servo_angles["tilt"])
+    n_total = int(((PAN_MAX-PAN_MIN)/GRID_STEP+1)*((TILT_MAX-TILT_MIN)/GRID_STEP+1))
     return {
         "armed":state["armed"],"setup_phase":state["setup_phase"],
         "cats_detected":cats,"cats_in_zone":in_z,
@@ -527,9 +563,13 @@ def status():
         "pan":round(servo_angles["pan"],1),"tilt":round(servo_angles["tilt"],1),
         "pan_pct":servo_pct(servo_angles["pan"],PAN_CENTER,PAN_RANGE),
         "tilt_pct":servo_pct(servo_angles["tilt"],TILT_CENTER,TILT_RANGE),
+        "grid_pan":gp,"grid_tilt":gt,
+        "grid_pan_pct":round(servo_pct(gp,PAN_CENTER,PAN_RANGE),1),
+        "grid_tilt_pct":round(servo_pct(gt,TILT_CENTER,TILT_RANGE),1),
         "detections":dets,"zone_px":zone_px,"zone_closed":z_closed,
         "setup_zone":setup_verts,"setup_zone_closed":setup_closed,"setup_zone_exact":is_exact,
         "n_cal_points":len(zone_cal["calibration_points"]),
+        "n_total_positions":n_total,
         "strength":strength,
         "cam":cam_settings,"depth_m":zone_cal["depth_m"],
     }
@@ -601,6 +641,21 @@ async def setup_zone(request: Request):
     data = await request.json()
     zone_vertices = data.get("vertices",[])
     zone_closed   = data.get("closed",False)
+    # If in calibration phase and zone is closed, save/update at current grid position
+    if state["setup_phase"] in ("forced_L","forced_R","forced_up","forced_down","extra"):
+        if zone_closed and len(zone_vertices) >= 3:
+            gp = grid_snap(servo_angles["pan"])
+            gt = grid_snap(servo_angles["tilt"])
+            # Remove existing point at this position and replace with user's version
+            zone_cal["calibration_points"] = [
+                p for p in zone_cal["calibration_points"]
+                if not (abs(p["pan"]-gp)<0.1 and abs(p["tilt"]-gt)<0.1)
+            ]
+            zone_cal["calibration_points"].append({
+                "pan": gp, "tilt": gt,
+                "vertices": [list(v) for v in zone_vertices]
+            })
+            save_zone_cal()
     return {"status":"ok","n_verts":len(zone_vertices)}
 
 @app.get("/setup/begin_forced_cal")
@@ -923,14 +978,11 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
 
   <div id="ph-extra" class="ph" style="display:none">
     <h3>Additional Calibration Points</h3>
-    <p>Pan/tilt to new positions and save points. Add at least 4 more for full strength.</p>
-    <p style="font-size:0.82em;color:#888;margin-top:4px">Drag vertices to adjust. Click inside zone to drag whole zone.</p>
+    <p>Pan/tilt anywhere — positions are saved automatically. Drag zone to adjust at any position.</p>
     <div class="ctrl">
       <button class="btn y" id="btn-tgt-e" onclick="toggleTgt()">▶ Targeting</button>
-      <button class="btn g" onclick="addExtraPt()">📍 Save Point Here</button>
     </div>
-    <div id="interp-debug" style="font-size:0.75em;color:#888;margin:4px 0;padding:4px;background:#111;border-radius:3px"></div>
-    <div id="cpl-list" style="max-height:180px;overflow-y:auto;margin:6px 0"></div>
+    <div id="interp-debug" style="font-size:0.78em;color:#aaa;margin:6px 0;padding:6px;background:#111;border-radius:3px;line-height:1.6"></div>
     <div class="ctrl" style="margin-top:8px">
       <button class="btn g" onclick="setupFinish()">✓ Finish Setup</button>
       <button class="btn gr" onclick="setupReset()">Start Over</button>
@@ -1104,11 +1156,6 @@ function saveForcedPt(){
   fetch('/setup/save_forced_point',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({vertices:verts})}).then(r=>r.json()).then(d=>applyPhase(d.phase));
 }
-function addExtraPt(){
-  fetch('/setup/add_extra_point',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({vertices:verts})}).then(r=>r.json()).then(d=>{
-    updStrength(d); loadCalPoints();});
-}
 function setupFinish(){fetch('/setup/finish');curPhase=null;applyPhase(null);}
 function setDepth(v){
   fetch('/setup/depth',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -1143,29 +1190,6 @@ function updStrength(data){
     fill.style.width='0%';
     text.textContent=n<3?`Need ${3-n} more point${3-n!==1?'s':''} for LOOCV assessment`:'Calculating...';
   }
-}
-
-function loadCalPoints(){
-  fetch('/setup/cal_points').then(r=>r.json()).then(d=>{
-    const list=document.getElementById('cpl-list');
-    if(!list)return;
-    if(!d.points||!d.points.length){list.innerHTML='<p style="color:#666;font-size:0.85em">No points saved</p>';return;}
-    list.innerHTML=d.points.map((p,i)=>`
-      <div class="cpl" onclick="gotoCalPt(${p.index})">
-        <span>Point ${p.index+1} — Pan ${p.pan}° Tilt ${p.tilt}°</span>
-        <button class="btn r" style="padding:3px 8px;font-size:0.8em"
-          onclick="event.stopPropagation();removeCalPt(${p.index})">✕</button>
-      </div>`).join('');
-  });
-}
-
-function gotoCalPt(idx){
-  fetch('/setup/goto_point',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({index:idx})});
-}
-function removeCalPt(idx){
-  fetch('/setup/remove_point',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({index:idx})}).then(r=>r.json()).then(d=>{updStrength(d);loadCalPoints();});
 }
 
 // ── Vertex Mode ────────────────────────────────────────────────────────────
@@ -1390,13 +1414,17 @@ setInterval(()=>{
     // Strength update whenever on setup page
     if(curPage==='setup'&&d.strength) updStrength({strength:d.strength,n_points:d.n_cal_points});
 
-    // Interpolation debug
+    // Interpolation debug in extra phase
     if(curPhase==='extra'){
-      fetch('/setup/interp_debug').then(r=>r.json()).then(dbg=>{
-        const el=document.getElementById('interp-debug');
-        if(el) el.textContent=`Method: ${dbg.method} | ${dbg.details}`;
-      });
-      loadCalPoints();
+      const el=document.getElementById('interp-debug');
+      if(el){
+        const n=d.n_cal_points||0;
+        const tot=d.n_total_positions||361;
+        const pct=Math.round(n/tot*100);
+        const exact=d.setup_zone_exact?'<span style="color:#0f8">● Exact saved point</span>':'<span style="color:#fa0">○ Interpolated</span>';
+        el.innerHTML=`${exact} | Grid: Pan ${d.grid_pan}° (${d.grid_pan_pct}%) Tilt ${d.grid_tilt}° (${d.grid_tilt_pct}%)<br>`+
+          `Saved ${n}/${tot} positions (${pct}%) — pan/tilt to explore, zone auto-saves`;
+      }
     }
 
     // Camera settings init
