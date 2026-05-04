@@ -129,7 +129,11 @@ def pixel_to_world_angle(cx, cy):
     tilt = servo_angles["tilt"] + ((cy - FRAME_H / 2) / FRAME_H) * V_FOV
     return pan, tilt
 
-def point_in_angle_zone(cx, cy, zone_points):
+def world_angle_to_pixel(pan, tilt):
+    """Convert world angle back to pixel position based on current servo position."""
+    cx = int((pan - servo_angles["pan"]) / H_FOV * FRAME_W + FRAME_W / 2)
+    cy = int((tilt - servo_angles["tilt"]) / V_FOV * FRAME_H + FRAME_H / 2)
+    return cx, cy
     """Check if pixel position falls inside zone defined in angle space."""
     if len(zone_points) < 3:
         return False
@@ -384,12 +388,13 @@ def generate_frames():
                 continue
             frame = latest_frame.copy()
 
-        if len(state["zone_points"]) >= 2:
-            pts = np.array(state["zone_points"], dtype=np.int32)
+        if len(state["zone_points"]) >= 2 and state["zone_closed"] or len(state["zone_points"]) >= 2:
+            pixel_pts = [world_angle_to_pixel(p[0], p[1]) for p in state["zone_points"]]
+            pts = np.array(pixel_pts, dtype=np.int32)
             cv2.polylines(frame, [pts], isClosed=state["zone_closed"],
                          color=(0, 255, 0), thickness=2)
-            for p in state["zone_points"]:
-                cv2.circle(frame, tuple(p), 5, (0, 255, 0), -1)
+            for p in pixel_pts:
+                cv2.circle(frame, p, 5, (0, 255, 0), -1)
 
         with detection_lock:
             detections = list(latest_detections)
