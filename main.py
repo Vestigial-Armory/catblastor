@@ -63,6 +63,11 @@ if CALIBRATION_FILE.exists():
 
 servo_angles = {"pan": 90.0, "tilt": 90.0}
 
+# ─── Home Position & Activity ─────────────────────────────────────────────────
+home_position = {"pan": 90.0, "tilt": 90.0}
+last_activity_time = time.time()
+HOME_TIMEOUT = 60.0  # seconds of inactivity before returning home
+
 # ─── Target Tracking State ───────────────────────────────────────────────────
 tracking = {
     "primary_target_id": None,
@@ -113,10 +118,12 @@ def pixel_to_angle(cx, cy):
     return clamp(pan, 45, 135), clamp(tilt, 45, 135)
 
 def move_servos(pan, tilt):
+    global last_activity_time
     kit.servo[PAN_CH].angle  = clamp(pan,  45, 135)
     kit.servo[TILT_CH].angle = clamp(tilt, 45, 135)
     servo_angles["pan"]  = pan
     servo_angles["tilt"] = tilt
+    last_activity_time = time.time()
 
 def save_calibration():
     CALIBRATION_FILE.write_text(json.dumps(calibration))
@@ -124,12 +131,23 @@ def save_calibration():
 def get_reticle_pos():
     return calibration_state["reticle_x"], calibration_state["reticle_y"]
 
-# ─── Capture Thread ──────────────────────────────────────────────────────────
+# ─── Home Position Thread ────────────────────────────────────────────────────
+def home_position_loop():
+    while True:
+        time.sleep(5)
+        if not state["armed"]:
+            continue
+        with detection_lock:
+            cats = len(latest_detections)
+        if cats == 0 and not firing["active"]:
+            if time.time() - last_activity_time > HOME_TIMEOUT:
+                move_servos(home_position["pan"], home_position["tilt"])
 def capture_loop():
     global latest_frame
     while True:
         frame = picam2.capture_array()
         frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        frame = cv2.rotate(frame, cv2.ROTATE_180)  # camera mounted upside down
         with frame_lock:
             latest_frame = frame.copy()
 
@@ -334,6 +352,7 @@ threading.Thread(target=servo_tracking_loop, daemon=True).start()
 threading.Thread(target=firing_loop,         daemon=True).start()
 threading.Thread(target=calibration_loop,    daemon=True).start()
 threading.Thread(target=recording_loop,      daemon=True).start()
+threading.Thread(target=home_position_loop,  daemon=True).start()
 
 # ─── FastAPI ─────────────────────────────────────────────────────────────────
 app = FastAPI()
@@ -472,6 +491,25 @@ def center_servos():
     move_servos(90, 90)
     return {"status": "centered"}
 
+@app.post("/servos/move")
+async def move_servos_endpoint(request: Request):
+    data = await request.json()
+    pan  = clamp(servo_angles["pan"]  + data.get("pan_delta",  0), 45, 135)
+    tilt = clamp(servo_angles["tilt"] + data.get("tilt_delta", 0), 45, 135)
+    move_servos(pan, tilt)
+    return {"pan": pan, "tilt": tilt}
+
+@app.get("/servos/home/set")
+def set_home():
+    home_position["pan"]  = servo_angles["pan"]
+    home_position["tilt"] = servo_angles["tilt"]
+    return {"home_pan": home_position["pan"], "home_tilt": home_position["tilt"]}
+
+@app.get("/servos/home/go")
+def go_home():
+    move_servos(home_position["pan"], home_position["tilt"])
+    return {"status": "going home"}
+
 @app.get("/recordings")
 def list_recordings():
     files = sorted(RECORDINGS_DIR.glob("*.mp4"), reverse=True)
@@ -565,6 +603,16 @@ HTML = """
     <button class="btn btn-yellow" id="btn-cal" onclick="toggleCalibration()">Calibrate</button>
     <button class="btn btn-gray" onclick="fetch('/servos/center')">Center Servos</button>
   </div>
+
+  <div class="controls" style="align-items:center">
+    <span style="color:#aaa;font-size:0.85em">Pan/Tilt:</span>
+    <button class="btn btn-gray" onclick="moveServo(0,-5)">▲ Tilt Up</button>
+    <button class="btn btn-gray" onclick="moveServo(0, 5)">▼ Tilt Down</button>
+    <button class="btn btn-gray" onclick="moveServo(-5,0)">◀ Pan Left</button>
+    <button class="btn btn-gray" onclick="moveServo( 5,0)">▶ Pan Right</button>
+    <button class="btn btn-gray" onclick="fetch('/servos/home/go')">🏠 Go Home</button>
+    <button class="btn btn-yellow" onclick="fetch('/servos/home/set')">📌 Set Home</button>
+  </div>
 </div>
 
 <!-- SETTINGS PAGE -->
@@ -620,6 +668,14 @@ let zonePoints = [];
 let zoneClosed = false;
 let currentMode = 'live';
 let calibrationActive = false;
+
+function moveServo(pan_delta, tilt_delta) {
+  fetch('/servos/move', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({pan_delta, tilt_delta})
+  });
+}
 
 function showPage(page, btn) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
