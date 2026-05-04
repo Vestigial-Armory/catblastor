@@ -119,20 +119,22 @@ def point_in_polygon(cx, cy, polygon):
     return cv2.pointPolygonTest(pts, (float(cx), float(cy)), False) >= 0
 
 def pixel_to_angle(cx, cy):
-    pan  = 90.0 + ((cx - FRAME_W / 2) / FRAME_W) * H_FOV
-    tilt = 90.0 + ((cy - FRAME_H / 2) / FRAME_H) * V_FOV
+    # Negate because camera is mounted upside down
+    pan  = 90.0 - ((cx - FRAME_W / 2) / FRAME_W) * H_FOV
+    tilt = 90.0 - ((cy - FRAME_H / 2) / FRAME_H) * V_FOV
     return clamp(pan, 45, 135), clamp(tilt, 45, 135)
 
 def pixel_to_world_angle(cx, cy):
     """Convert pixel position to absolute world angle using current servo position."""
-    pan  = servo_angles["pan"]  + ((cx - FRAME_W / 2) / FRAME_W) * H_FOV
-    tilt = servo_angles["tilt"] + ((cy - FRAME_H / 2) / FRAME_H) * V_FOV
+    # Negate offsets because camera is mounted upside down and image is flipped
+    pan  = servo_angles["pan"]  - ((cx - FRAME_W / 2) / FRAME_W) * H_FOV
+    tilt = servo_angles["tilt"] - ((cy - FRAME_H / 2) / FRAME_H) * V_FOV
     return pan, tilt
 
 def world_angle_to_pixel(pan, tilt):
     """Convert world angle back to pixel position based on current servo position."""
-    cx = int((pan - servo_angles["pan"]) / H_FOV * FRAME_W + FRAME_W / 2)
-    cy = int((tilt - servo_angles["tilt"]) / V_FOV * FRAME_H + FRAME_H / 2)
+    cx = int(-(pan  - servo_angles["pan"])  / H_FOV * FRAME_W + FRAME_W / 2)
+    cy = int(-(tilt - servo_angles["tilt"]) / V_FOV * FRAME_H + FRAME_H / 2)
     return cx, cy
     """Check if pixel position falls inside zone defined in angle space."""
     if len(zone_points) < 3:
