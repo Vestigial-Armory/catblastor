@@ -406,8 +406,9 @@ def start_ffmpeg_hls():
         "-video_size", f"{FRAME_W}x{FRAME_H}",
         "-framerate", "15",
         "-i", PIPE_PATH,
+        "-vf", "format=yuv420p",
         "-c:v", "h264_v4l2m2m",
-        "-b:v", "800k",
+        "-b:v", "1000k",
         "-g", "15",
         "-f", "hls",
         "-hls_time", "0.5",
@@ -415,7 +416,7 @@ def start_ffmpeg_hls():
         "-hls_flags", "delete_segments+append_list",
         str(HLS_DIR / "stream.m3u8")
     ]
-    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     time.sleep(1.0)
     hls_pipe = open(PIPE_PATH, "wb")
 
