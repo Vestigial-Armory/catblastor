@@ -1,7 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from picamera2 import Picamera2
 from ultralytics import YOLO
 from adafruit_servokit import ServoKit
 import cv2
@@ -17,27 +16,34 @@ from pathlib import Path
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 FRAME_W, FRAME_H = 640, 480
-INFER_W, INFER_H = 320, 240  # lower resolution for inference — ~4x faster
+INFER_W, INFER_H = 320, 240
 PAN_CH, TILT_CH = 0, 1
 PUMP_PIN, SOLENOID_PIN = 27, 17
 CAT_CLASS = 15
 RECORDINGS_DIR = Path("/home/wolfhard/catblastor/recordings")
 CALIBRATION_FILE = Path("/home/wolfhard/catblastor/calibration.json")
 FOV_FILE = Path("/home/wolfhard/catblastor/fov_calibration.json")
+INFER_PIPE = "/tmp/catblastor_infer"
 RECORDINGS_DIR.mkdir(exist_ok=True)
 HLS_DIR = Path("/tmp/catblastor_hls")
 HLS_DIR.mkdir(exist_ok=True)
+INFER_PIPE = "/tmp/catblastor_infer"
+
+# Create inference pipe
+if not os.path.exists(INFER_PIPE):
+    os.mkfifo(INFER_PIPE)
 
 def start_streaming():
     """
-    rpicam-vid streams raw H264 to TCP port 8888.
-    ffmpeg picks it up and outputs HLS segments.
-    Python never touches the stream — zero CPU cost for streaming.
+    rpicam-vid streams H264 to TCP.
+    ffmpeg reads it and outputs:
+      1. HLS segments for browser
+      2. Raw BGR frames at 320x240 to a named pipe for Python inference
     """
     rpicam_cmd = [
         "rpicam-vid",
-        "--width", str(FRAME_W),
-        "--height", str(FRAME_H),
+        "--width", "640",
+        "--height", "480",
         "--framerate", "30",
         "--bitrate", "2000000",
         "--inline",
@@ -45,23 +51,42 @@ def start_streaming():
         "-o", "tcp://0.0.0.0:8888",
         "-t", "0",
         "--nopreview",
-        "--vflip",   # camera mounted upside down
-        "--hflip",   # camera mounted upside down
+        "--vflip",
+        "--hflip",
     ]
+
     ffmpeg_cmd = [
         "ffmpeg", "-y",
         "-f", "h264",
         "-i", "tcp://127.0.0.1:8888",
+        # Output 1 — HLS for browser (copy H264, no re-encode)
+        "-map", "0:v",
         "-c:v", "copy",
         "-f", "hls",
         "-hls_time", "0.5",
         "-hls_list_size", "4",
         "-hls_flags", "delete_segments+append_list",
-        str(HLS_DIR / "stream.m3u8")
+        str(HLS_DIR / "stream.m3u8"),
+        # Output 2 — raw BGR frames at inference resolution for Python
+        "-map", "0:v",
+        "-vf", "scale=320:240,format=bgr24",
+        "-r", "5",  # 5fps is plenty for inference
+        "-f", "rawvideo",
+        INFER_PIPE,
     ]
-    subprocess.Popen(rpicam_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(2.0)  # let rpicam-vid start before ffmpeg connects
-    subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    proc_cam = subprocess.Popen(
+        rpicam_cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    time.sleep(2.0)
+    proc_ffmpeg = subprocess.Popen(
+        ffmpeg_cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    print("Streaming started")
 
 # Mutable FOV — updated by zone drag calibration
 fov = {"h": 66.0, "v": 41.0}
@@ -82,12 +107,6 @@ GPIO.output(SOLENOID_PIN, GPIO.LOW)
 kit = ServoKit(channels=16)
 kit.servo[PAN_CH].angle = 90
 kit.servo[TILT_CH].angle = 90
-
-picam2 = Picamera2()
-picam2.configure(picam2.create_preview_configuration(
-    main={"format": "XBGR8888", "size": (FRAME_W, FRAME_H)}
-))
-picam2.start()
 
 model = YOLO("yolov8n.pt")
 
@@ -180,7 +199,8 @@ def world_angle_to_pixel(pan, tilt):
     cx = int(-(pan  - servo_angles["pan"])  / fov["h"] * FRAME_W + FRAME_W / 2)
     cy = int(-(tilt - servo_angles["tilt"]) / fov["v"] * FRAME_H + FRAME_H / 2)
     return cx, cy
-    """Check if pixel position falls inside zone defined in angle space."""
+
+def point_in_angle_zone(cx, cy, zone_points):
     if len(zone_points) < 3:
         return False
     pan, tilt = pixel_to_world_angle(cx, cy)
@@ -212,19 +232,33 @@ def home_position_loop():
         if cats == 0 and not firing["active"]:
             if time.time() - last_activity_time > HOME_TIMEOUT:
                 move_servos(home_position["pan"], home_position["tilt"])
+
+# ─── Capture Thread — reads raw frames from ffmpeg inference pipe ─────────────
 def capture_loop():
     global latest_frame
+    frame_size = INFER_W * INFER_H * 3  # BGR24
+    print("Waiting for inference pipe...")
     while True:
-        frame = picam2.capture_array()
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
-        frame = cv2.flip(frame, -1)
-        # Correct IR color cast from NoIR camera — reduce blue channel
-        frame = frame.astype(np.float32)
-        frame[:,:,2] = np.clip(frame[:,:,2] * 0.6, 0, 255)  # reduce blue
-        frame[:,:,0] = np.clip(frame[:,:,0] * 1.1, 0, 255)  # boost red slightly
-        frame = frame.astype(np.uint8)
-        with frame_lock:
-            latest_frame = frame.copy()
+        try:
+            pipe = open(INFER_PIPE, "rb")
+            print("Inference pipe connected")
+            break
+        except Exception:
+            time.sleep(0.5)
+    while True:
+        try:
+            data = pipe.read(frame_size)
+            if len(data) != frame_size:
+                pipe.close()
+                time.sleep(0.1)
+                pipe = open(INFER_PIPE, "rb")
+                continue
+            frame = np.frombuffer(data, dtype=np.uint8).reshape((INFER_H, INFER_W, 3))
+            with frame_lock:
+                latest_frame = frame.copy()
+        except Exception as e:
+            print(f"Pipe read error: {e}")
+            time.sleep(0.1)
 
 # ─── Inference Thread ────────────────────────────────────────────────────────
 def inference_loop():
@@ -238,9 +272,7 @@ def inference_loop():
             if latest_frame is None:
                 continue
             frame = latest_frame.copy()
-        # Resize to inference resolution for speed
-        small = cv2.resize(frame, (INFER_W, INFER_H))
-        results = model(small, verbose=False)
+        results = model(frame, verbose=False)
         scale_x = FRAME_W / INFER_W
         scale_y = FRAME_H / INFER_H
         detections = []
@@ -249,7 +281,6 @@ def inference_loop():
             conf = float(r.conf)
             if cls == CAT_CLASS and conf >= state["confidence_threshold"]:
                 x1, y1, x2, y2 = map(int, r.xyxy[0])
-                # Scale back to full resolution
                 x1 = int(x1 * scale_x); y1 = int(y1 * scale_y)
                 x2 = int(x2 * scale_x); y2 = int(y2 * scale_y)
                 cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
