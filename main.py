@@ -580,6 +580,18 @@ async def drag_zone(request: Request):
 @app.get("/fov")
 def get_fov():
     return {"h": fov["h"], "v": fov["v"]}
+
+@app.post("/fov")
+async def set_fov(request: Request):
+    data = await request.json()
+    if "h" in data:
+        fov["h"] = round(clamp(float(data["h"]), 20.0, 120.0), 2)
+    if "v" in data:
+        fov["v"] = round(clamp(float(data["v"]), 10.0, 80.0), 2)
+    save_fov()
+    return {"h": fov["h"], "v": fov["v"]}
+
+@app.get("/zone/clear")
 def clear_zone():
     state["zone_points"] = []
     state["zone_closed"] = False
@@ -775,13 +787,28 @@ HTML = """
     <button class="btn btn-yellow" onclick="fetch('/servos/home/set')">📌 Set Home</button>
   </div>
 
-  <div style="color:#aaa;font-size:0.8em;margin-top:8px;padding:8px;background:#1a1a1a;border-radius:4px;max-width:640px">
-    <strong style="color:#fff">How to calibrate:</strong><br>
-    1. Draw and close a zone at home position<br>
-    2. Pan/tilt to a reference point — zone should shift with camera<br>
-    3. If zone position is off, drag it to correct position<br>
-    4. Dragging updates the pixel:angle ratio automatically<br>
-    5. Use Targeting to fire and verify stream hits the zone
+  <div style="margin-top:12px;padding:12px;background:#1a1a1a;border-radius:4px;max-width:640px">
+    <strong style="color:#fff">FOV Calibration</strong>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px">
+      <div>
+        <label style="color:#aaa;font-size:0.85em">H-FOV (°): <span id="val-hfov" style="color:#fff">66.0</span></label><br>
+        <button class="btn btn-gray" style="padding:4px 10px" onclick="adjustFov('h',-1)">−</button>
+        <button class="btn btn-gray" style="padding:4px 10px" onclick="adjustFov('h',-0.1)">−0.1</button>
+        <button class="btn btn-gray" style="padding:4px 10px" onclick="adjustFov('h',0.1)">+0.1</button>
+        <button class="btn btn-gray" style="padding:4px 10px" onclick="adjustFov('h',1)">+</button>
+      </div>
+      <div>
+        <label style="color:#aaa;font-size:0.85em">V-FOV (°): <span id="val-vfov" style="color:#fff">41.0</span></label><br>
+        <button class="btn btn-gray" style="padding:4px 10px" onclick="adjustFov('v',-1)">−</button>
+        <button class="btn btn-gray" style="padding:4px 10px" onclick="adjustFov('v',-0.1)">−0.1</button>
+        <button class="btn btn-gray" style="padding:4px 10px" onclick="adjustFov('v',0.1)">+0.1</button>
+        <button class="btn btn-gray" style="padding:4px 10px" onclick="adjustFov('v',1)">+</button>
+      </div>
+    </div>
+    <div style="color:#aaa;font-size:0.75em;margin-top:8px">
+      Drag the closed zone to correct its position — adjusts ratio automatically.<br>
+      Or use +/− buttons to tune manually.
+    </div>
   </div>
 </div>
 
@@ -876,6 +903,12 @@ function showPage(page, btn) {
   document.getElementById(page).classList.add('active');
   btn.classList.add('active');
   calibrationMode = (page === 'calibration');
+  if (calibrationMode) {
+    fetch('/fov').then(r => r.json()).then(d => {
+      document.getElementById('val-hfov').textContent = d.h;
+      document.getElementById('val-vfov').textContent = d.v;
+    });
+  }
   if (!calibrationMode && targetingActive) {
     targetingActive = false;
     fetch('/calibration/stop');
@@ -950,13 +983,14 @@ if (calCanvas) {
   });
 
   calCanvas.addEventListener('click', (e) => {
-    if (zoneClosed) return;  // drag handles zone interaction
+    if (zoneClosed) return;
     if (currentMode !== 'zone_draw') return;
     const rect = calCanvas.getBoundingClientRect();
     zonePoints.push([
       Math.round(e.clientX - rect.left),
       Math.round(e.clientY - rect.top)
     ]);
+    drawZonePreview(calCanvas);
   });
 }
 
@@ -967,12 +1001,15 @@ canvas.addEventListener('click', (e) => {
     Math.round(e.clientX - rect.left),
     Math.round(e.clientY - rect.top)
   ]);
+  drawZonePreview(canvas);
 });
 
 function clearZoneLocal() {
   zonePoints = [];
   zoneClosed = false;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const calCvs = document.getElementById('overlay-cal');
+  if (calCvs) calCvs.getContext('2d').clearRect(0, 0, calCvs.width, calCvs.height);
   fetch('/zone/clear');
 }
 
@@ -984,8 +1021,40 @@ function sendZone() {
   });
 }
 
-function drawOverlay() {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+function adjustFov(axis, delta) {
+  fetch('/fov').then(r => r.json()).then(d => {
+    const newVal = Math.round((d[axis] + delta) * 10) / 10;
+    const body = {};
+    body[axis] = newVal;
+    fetch('/fov', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    }).then(r => r.json()).then(d => {
+      document.getElementById('val-hfov').textContent = d.h;
+      document.getElementById('val-vfov').textContent = d.v;
+    });
+  });
+}
+
+function drawZonePreview(canvasEl) {
+  const ctx = canvasEl.getContext('2d');
+  ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+  if (zonePoints.length === 0) return;
+  ctx.strokeStyle = '#00ffff';
+  ctx.fillStyle = '#00ffff';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(zonePoints[0][0], zonePoints[0][1]);
+  for (let i = 1; i < zonePoints.length; i++) {
+    ctx.lineTo(zonePoints[i][0], zonePoints[i][1]);
+  }
+  ctx.stroke();
+  zonePoints.forEach(p => {
+    ctx.beginPath();
+    ctx.arc(p[0], p[1], 5, 0, 2*Math.PI);
+    ctx.fill();
+  });
 }
 
 function toggleTargeting() {
