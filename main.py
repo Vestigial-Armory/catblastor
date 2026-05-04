@@ -291,13 +291,10 @@ def move_servos(pan, tilt, slow=False):
         kit.servo[TILT_CH].angle = tilt
         servo_angles["pan"] = pan; servo_angles["tilt"] = tilt
     last_activity_time = time.time()
-    # Auto-save if we moved to a new grid position
     gp = grid_snap(servo_angles["pan"])
     gt = grid_snap(servo_angles["tilt"])
-    if gp != last_grid_pos["pan"] or gt != last_grid_pos["tilt"]:
-        last_grid_pos["pan"] = gp
-        last_grid_pos["tilt"] = gt
-        threading.Thread(target=auto_save_calibration_point, daemon=True).start()
+    last_grid_pos["pan"] = gp
+    last_grid_pos["tilt"] = gt
 
 def servo_pct(angle, center, rang):
     return round((angle-center)/rang*100.0, 1)
@@ -869,7 +866,6 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
   <nav>
     <button class="active" onclick="showPage('live',this)">Live</button>
     <button onclick="showPage('setup',this)">Setup</button>
-    <button onclick="showPage('settings',this)">Settings</button>
     <button onclick="showPage('recordings',this)">Recordings</button>
   </nav>
 </header>
@@ -978,9 +974,10 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
 
   <div id="ph-extra" class="ph" style="display:none">
     <h3>Additional Calibration Points</h3>
-    <p>Pan/tilt anywhere — positions are saved automatically. Drag zone to adjust at any position.</p>
+    <p>Pan/tilt to a position, adjust zone if needed, then save the point.</p>
     <div class="ctrl">
       <button class="btn y" id="btn-tgt-e" onclick="toggleTgt()">▶ Targeting</button>
+      <button class="btn g" onclick="savePointHere()">📍 Save Point Here</button>
     </div>
     <div id="interp-debug" style="font-size:0.78em;color:#aaa;margin:6px 0;padding:6px;background:#111;border-radius:3px;line-height:1.6"></div>
     <div class="ctrl" style="margin-top:8px">
@@ -1155,6 +1152,12 @@ function beginForcedCal(){fetch('/setup/begin_forced_cal').then(r=>r.json()).the
 function saveForcedPt(){
   fetch('/setup/save_forced_point',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({vertices:verts})}).then(r=>r.json()).then(d=>applyPhase(d.phase));
+}
+function savePointHere(){
+  fetch('/setup/add_extra_point',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({vertices:verts})}).then(r=>r.json()).then(d=>{
+    updStrength(d);
+  });
 }
 function setupFinish(){fetch('/setup/finish');curPhase=null;applyPhase(null);}
 function setDepth(v){
