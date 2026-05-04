@@ -908,6 +908,23 @@ canvas.addEventListener('click', (e) => {
 });
 
 function clearZoneLocal() {
+  zonePoints = [];
+  zoneClosed = false;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  fetch('/zone/clear');
+}
+
+function sendZone() {
+  fetch('/zone', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({points: zonePoints, closed: zoneClosed})
+  });
+}
+
+function drawOverlay() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+}
 
 function toggleTargeting() {
   targetingActive = !targetingActive;
