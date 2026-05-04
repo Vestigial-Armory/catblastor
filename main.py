@@ -395,13 +395,13 @@ def generate_frames():
                 continue
             frame = latest_frame.copy()
 
-        if len(state["zone_points"]) >= 2 and state["zone_closed"] or len(state["zone_points"]) >= 2:
+        if len(state["zone_points"]) >= 2:
             pixel_pts = [world_angle_to_pixel(p[0], p[1]) for p in state["zone_points"]]
             pts = np.array(pixel_pts, dtype=np.int32)
-            cv2.polylines(frame, [pts], isClosed=state["zone_closed"],
-                         color=(0, 255, 0), thickness=2)
+            color = (0, 255, 0) if state["zone_closed"] else (0, 255, 255)
+            cv2.polylines(frame, [pts], isClosed=state["zone_closed"], color=color, thickness=2)
             for p in pixel_pts:
-                cv2.circle(frame, p, 5, (0, 255, 0), -1)
+                cv2.circle(frame, p, 5, color, -1)
 
         with detection_lock:
             detections = list(latest_detections)
