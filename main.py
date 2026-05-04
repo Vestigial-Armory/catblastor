@@ -174,6 +174,11 @@ def capture_loop():
         frame = picam2.capture_array()
         frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
         frame = cv2.flip(frame, -1)
+        # Correct IR color cast from NoIR camera — reduce blue channel
+        frame = frame.astype(np.float32)
+        frame[:,:,2] = np.clip(frame[:,:,2] * 0.6, 0, 255)  # reduce blue
+        frame[:,:,0] = np.clip(frame[:,:,0] * 1.1, 0, 255)  # boost red slightly
+        frame = frame.astype(np.uint8)
         with frame_lock:
             latest_frame = frame.copy()
 
