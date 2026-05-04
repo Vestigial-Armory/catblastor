@@ -59,22 +59,22 @@ def interpolate_zone(pan, tilt):
 
 def get_interpolation_debug(pan, tilt):
     pts = zone_cal["calibration_points"]
-    n_total_possible = int(((PAN_MAX-PAN_MIN)/GRID_STEP + 1) * ((TILT_MAX-TILT_MIN)/GRID_STEP + 1))
-    base = {"n_points": len(pts), "n_total_possible": n_total_possible,
-            "coverage_pct": round(len(pts)/n_total_possible*100, 1)}
+    n_total = int(((PAN_MAX-PAN_MIN)/GRID_STEP+1)*((TILT_MAX-TILT_MIN)/GRID_STEP+1))
+    base = {"n_points":len(pts),"n_total_possible":n_total,
+            "coverage_pct":round(len(pts)/n_total*100,1)}
     if not pts:
-        return {**base, "method":"no_data","details":"No calibration points"}
-    exact = next((p for p in pts
-                  if abs(p["pan"]-pan)<0.5 and abs(p["tilt"]-tilt)<0.5), None)
-    if exact:
-        return {**base, "method":"exact","details":f"Exact match at pan={exact['pan']} tilt={exact['tilt']}"}
-    distances = [round(float(np.sqrt((pan-p["pan"])**2+(tilt-p["tilt"])**2)),1) for p in pts]
+        return {**base,"method":"no_data","details":"No calibration points saved"}
+    def dist(p): return float(np.sqrt((pan-p["pan"])**2+(tilt-p["tilt"])**2))
+    nearest = min(pts, key=dist)
+    nd = round(dist(nearest), 2)
+    if nd < 2.5:
+        return {**base,"method":"exact",
+                "details":f"Nearest saved point {nd}° away (pan={nearest['pan']} tilt={nearest['tilt']}) — shown exactly"}
     if len(pts) >= 3:
-        return {**base, "method":"linear_regression",
-                "details":f"Linear fit from {len(pts)} pts. Distances: {distances}",
-                "loocv":compute_calibration_strength()}
-    return {**base, "method":"nearest_neighbor",
-            "details":f"Only {len(pts)} pts — using nearest. Distances: {distances}"}
+        return {**base,"method":"linear_regression",
+                "details":f"Nearest saved point {nd}° away — interpolating from {len(pts)} pts"}
+    return {**base,"method":"nearest_neighbor",
+            "details":f"Nearest saved point {nd}° away — only {len(pts)} pts (need 3 for regression)"}
 
 loocv_counter = 0
 
@@ -124,9 +124,10 @@ def _interpolate_with_cal(cal, pan, tilt):
     pts = cal["calibration_points"]
     if not pts: return None
     if len(pts) == 1: return [list(v) for v in pts[0]["vertices"]]
-    exact = next((p for p in pts
-                  if abs(p["pan"]-pan)<0.5 and abs(p["tilt"]-tilt)<0.5), None)
-    if exact: return [list(v) for v in exact["vertices"]]
+    # Find nearest point
+    def dist(p): return float(np.sqrt((pan-p["pan"])**2+(tilt-p["tilt"])**2))
+    nearest = min(pts, key=dist)
+    if dist(nearest) < 2.5: return [list(v) for v in nearest["vertices"]]
     n_verts = len(pts[0]["vertices"])
     if len(pts) >= 3:
         try:
@@ -142,8 +143,7 @@ def _interpolate_with_cal(cal, pan, tilt):
                                 int(round(float(cy[0]*pan + cy[1]*tilt + cy[2])))])
             if len(result) == n_verts: return result
         except Exception: pass
-    distances = [float(np.sqrt((pan-p["pan"])**2+(tilt-p["tilt"])**2)) for p in pts]
-    return [list(v) for v in pts[int(np.argmin(distances))]["vertices"]]
+    return [list(v) for v in nearest["vertices"]]
 
 # ─── MJPEG Streaming ─────────────────────────────────────────────────────────
 mjpeg_buffer = b""
@@ -300,18 +300,21 @@ zone_vertices = list(zone_cal.get("home_vertices", []))
 zone_closed   = bool(zone_cal.get("home_closed", False))
 
 def get_setup_zone():
-    """Return exact saved zone for current servo position, or interpolated if not saved.
-    User-set points are NEVER replaced by interpolation."""
+    """Return zone for current servo position.
+    - If a saved point is within 2.5° (half grid step), return it exactly.
+    - Otherwise interpolate from all saved points.
+    - User-set points are never modified by interpolation.
+    """
     pan, tilt = servo_angles["pan"], servo_angles["tilt"]
     pts = zone_cal["calibration_points"]
     if not pts:
         return zone_vertices, zone_closed, False
-    # Check for exact saved point at current position (user_set or any saved)
-    exact = next((p for p in pts
-                  if abs(p["pan"]-pan)<0.5 and abs(p["tilt"]-tilt)<0.5), None)
-    if exact:
-        return exact["vertices"], True, True
-    # Interpolate only for unsaved positions
+    # Find nearest saved calibration point
+    def dist(p): return np.sqrt((pan-p["pan"])**2 + (tilt-p["tilt"])**2)
+    nearest = min(pts, key=dist)
+    if dist(nearest) < 2.5:
+        return nearest["vertices"], True, True
+    # Outside 2.5° of any saved point — interpolate
     interp = interpolate_zone(pan, tilt)
     if interp:
         return interp, True, False
@@ -639,21 +642,22 @@ async def setup_zone(request: Request):
     data = await request.json()
     zone_vertices = data.get("vertices",[])
     zone_closed   = data.get("closed",False)
-    # Always persist the home vertices so they survive restart
-    zone_cal["home_vertices"] = [list(v) for v in zone_vertices]
-    zone_cal["home_closed"]   = zone_closed
-    # If zone is closed and we have calibration points, save/update at EXACT current servo position
+    # Only update home_vertices during the draw phase
+    if state["setup_phase"] == "draw":
+        zone_cal["home_vertices"] = [list(v) for v in zone_vertices]
+        zone_cal["home_closed"]   = zone_closed
+    # Save to calibration_points with 1.0° replacement tolerance
     if zone_closed and len(zone_vertices) >= 3:
-        pan = round(servo_angles["pan"], 1)
+        pan  = round(servo_angles["pan"],  1)
         tilt = round(servo_angles["tilt"], 1)
         zone_cal["calibration_points"] = [
             p for p in zone_cal["calibration_points"]
-            if not (abs(p["pan"]-pan)<0.5 and abs(p["tilt"]-tilt)<0.5)
+            if not (abs(p["pan"]-pan)<1.0 and abs(p["tilt"]-tilt)<1.0)
         ]
         zone_cal["calibration_points"].append({
-            "pan": pan, "tilt": tilt,
-            "vertices": [list(v) for v in zone_vertices],
-            "user_set": True
+            "pan":pan,"tilt":tilt,
+            "vertices":[list(v) for v in zone_vertices],
+            "user_set":True
         })
     save_zone_cal()
     return {"status":"ok","n_verts":len(zone_vertices)}
@@ -683,8 +687,8 @@ async def save_forced_point(request: Request):
     vertices = data.get("vertices", zone_vertices)
     phase    = state["setup_phase"]
     existing = next((p for p in zone_cal["calibration_points"]
-                     if abs(p["pan"]-servo_angles["pan"])<0.5 and
-                        abs(p["tilt"]-servo_angles["tilt"])<0.5), None)
+                     if abs(p["pan"]-round(servo_angles["pan"],1))<1.0 and
+                        abs(p["tilt"]-round(servo_angles["tilt"],1))<1.0), None)
     point = {"pan":round(servo_angles["pan"],1),"tilt":round(servo_angles["tilt"],1),
              "vertices":[list(v) for v in vertices],"user_set":True}
     if existing: zone_cal["calibration_points"].remove(existing)
@@ -708,8 +712,8 @@ async def add_extra_point(request: Request):
     data     = await request.json()
     vertices = data.get("vertices", zone_vertices)
     existing = next((p for p in zone_cal["calibration_points"]
-                     if abs(p["pan"]-servo_angles["pan"])<0.5 and
-                        abs(p["tilt"]-servo_angles["tilt"])<0.5), None)
+                     if abs(p["pan"]-round(servo_angles["pan"],1))<1.0 and
+                        abs(p["tilt"]-round(servo_angles["tilt"],1))<1.0), None)
     point = {"pan":round(servo_angles["pan"],1),"tilt":round(servo_angles["tilt"],1),
              "vertices":[list(v) for v in vertices],"user_set":True}
     if existing: zone_cal["calibration_points"].remove(existing)
