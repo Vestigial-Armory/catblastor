@@ -31,40 +31,55 @@ if not os.path.exists(INFER_PIPE):
 
 def start_streaming():
     """
-    rpicam-vid outputs MJPEG directly to TCP:8080 — browser loads as img src.
-    ffmpeg separately grabs from rpicam-vid and outputs raw frames to inference pipe.
-    Two separate rpicam-vid instances can't share camera, so we use one rpicam-vid
-    for MJPEG and ffmpeg to decode and pipe frames for inference.
+    rpicam-vid outputs MJPEG to stdout.
+    ffmpeg reads it and:
+      1. Serves MJPEG over HTTP on port 8888 for browser
+      2. Tees raw BGR frames at inference resolution to named pipe for Python
     """
-    # MJPEG stream direct from camera hardware
-    mjpeg_cmd = [
+    rpicam_cmd = [
         "rpicam-vid",
         "--width", "640",
         "--height", "480",
         "--framerate", "30",
         "--codec", "mjpeg",
         "--inline",
-        "--listen",
-        "-o", "tcp://0.0.0.0:8888",
+        "-o", "-",
         "-t", "0",
         "--nopreview",
         "--vflip",
         "--hflip",
     ]
 
-    # ffmpeg reads MJPEG stream and outputs raw frames for inference
-    infer_cmd = [
+    ffmpeg_cmd = [
         "ffmpeg", "-y",
-        "-i", "tcp://127.0.0.1:8888",
+        "-f", "mjpeg",
+        "-i", "pipe:0",
+        # Output 1 — HTTP MJPEG for browser
+        "-map", "0:v",
+        "-c:v", "copy",
+        "-f", "mjpeg",
+        "-listen", "1",
+        "http://0.0.0.0:8888/stream",
+        # Output 2 — raw BGR frames for inference
+        "-map", "0:v",
         "-vf", f"scale={INFER_W}:{INFER_H},format=bgr24",
         "-r", "5",
         "-f", "rawvideo",
         INFER_PIPE,
     ]
 
-    subprocess.Popen(mjpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(2.0)
-    subprocess.Popen(infer_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    rpicam_proc = subprocess.Popen(
+        rpicam_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL
+    )
+    time.sleep(1.0)
+    subprocess.Popen(
+        ffmpeg_cmd,
+        stdin=rpicam_proc.stdout,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
     print("Streaming started")
 
 # Mutable FOV — updated by zone drag calibration
@@ -454,25 +469,6 @@ threading.Thread(target=start_streaming,     daemon=True).start()
 # ─── FastAPI ─────────────────────────────────────────────────────────────────
 app = FastAPI()
 
-@app.get("/stream")
-def stream():
-    import socket
-    def generate():
-        # Retry connecting to rpicam-vid for up to 10 seconds
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        for _ in range(20):
-            try:
-                sock.connect(("127.0.0.1", 8888))
-                break
-            except ConnectionRefusedError:
-                time.sleep(0.5)
-        while True:
-            chunk = sock.recv(65536)
-            if not chunk:
-                break
-            yield chunk
-    return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
-
 @app.get("/arm")
 def arm():
     state["armed"] = True
@@ -736,7 +732,7 @@ HTML = """
 
   <div id="video-container">
     <div style="position:relative;display:inline-block">
-      <img src="/stream" width="640" height="480" style="display:block;background:#000"/>
+      <img src="http://catblastor.local:8888/stream" width="640" height="480" style="display:block;background:#000"/>
       <canvas id="overlay" width="640" height="480" style="position:absolute;top:0;left:0;cursor:crosshair"></canvas>
     </div>
   </div>
@@ -765,7 +761,7 @@ HTML = """
 <div id="calibration" class="page">
   <div id="video-container-cal">
     <div style="position:relative;display:inline-block">
-      <img src="/stream" width="640" height="480" style="display:block;background:#000"/>
+      <img src="http://catblastor.local:8888/stream" width="640" height="480" style="display:block;background:#000"/>
       <canvas id="overlay-cal" width="640" height="480" style="position:absolute;top:0;left:0;cursor:crosshair"></canvas>
     </div>
   </div>
