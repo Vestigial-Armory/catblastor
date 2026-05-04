@@ -123,6 +123,20 @@ def pixel_to_angle(cx, cy):
     tilt = 90.0 + ((cy - FRAME_H / 2) / FRAME_H) * V_FOV
     return clamp(pan, 45, 135), clamp(tilt, 45, 135)
 
+def pixel_to_world_angle(cx, cy):
+    """Convert pixel position to absolute world angle using current servo position."""
+    pan  = servo_angles["pan"]  + ((cx - FRAME_W / 2) / FRAME_W) * H_FOV
+    tilt = servo_angles["tilt"] + ((cy - FRAME_H / 2) / FRAME_H) * V_FOV
+    return pan, tilt
+
+def point_in_angle_zone(cx, cy, zone_points):
+    """Check if pixel position falls inside zone defined in angle space."""
+    if len(zone_points) < 3:
+        return False
+    pan, tilt = pixel_to_world_angle(cx, cy)
+    pts = np.array(zone_points, dtype=np.float32)
+    return cv2.pointPolygonTest(pts, (float(pan), float(tilt)), False) >= 0
+
 def move_servos(pan, tilt):
     global last_activity_time
     kit.servo[PAN_CH].angle  = clamp(pan,  45, 135)
@@ -178,7 +192,7 @@ def inference_loop():
                 x1, y1, x2, y2 = map(int, r.xyxy[0])
                 cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
                 in_zone = (
-                    point_in_polygon(cx, cy, state["zone_points"])
+                    point_in_angle_zone(cx, cy, state["zone_points"])
                     if state["zone_closed"] and len(state["zone_points"]) >= 3
                     else False
                 )
@@ -450,7 +464,13 @@ async def update_settings(request: Request):
 @app.post("/zone")
 async def set_zone(request: Request):
     data = await request.json()
-    state["zone_points"] = data.get("points", [])
+    raw_points = data.get("points", [])
+    # Convert pixel coordinates to world angle space using current servo position
+    angle_points = []
+    for p in raw_points:
+        pan, tilt = pixel_to_world_angle(p[0], p[1])
+        angle_points.append([pan, tilt])
+    state["zone_points"] = angle_points
     state["zone_closed"] = data.get("closed", False)
     return {"status": "zone updated"}
 
