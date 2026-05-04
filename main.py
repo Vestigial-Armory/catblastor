@@ -153,7 +153,7 @@ def capture_loop():
     while True:
         frame = picam2.capture_array()
         frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-        frame = cv2.rotate(frame, cv2.ROTATE_180)  # camera mounted upside down
+        frame = cv2.flip(frame, -1)  # flip both axes = 180° rotation, preserves color
         with frame_lock:
             latest_frame = frame.copy()
 
@@ -500,7 +500,7 @@ def center_servos():
 @app.post("/servos/move")
 async def move_servos_endpoint(request: Request):
     data = await request.json()
-    pan  = clamp(servo_angles["pan"]  + data.get("pan_delta",  0), 45, 135)
+    pan  = clamp(servo_angles["pan"]  - data.get("pan_delta",  0), 45, 135)  # inverted
     tilt = clamp(servo_angles["tilt"] + data.get("tilt_delta", 0), 45, 135)
     move_servos(pan, tilt)
     return {"pan": pan, "tilt": tilt}
