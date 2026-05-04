@@ -636,6 +636,10 @@ def setup_set_home():
     save_home_position(); state["setup_phase"] = "draw"
     return {"phase":"draw"}
 
+def _same_position(p, pan, tilt):
+    """True if calibration point p is at the same physical position (within 0.6° Euclidean)."""
+    return float(np.sqrt((p["pan"]-pan)**2 + (p["tilt"]-tilt)**2)) < 0.6
+
 @app.post("/setup/zone")
 async def setup_zone(request: Request):
     global zone_vertices, zone_closed
@@ -646,13 +650,13 @@ async def setup_zone(request: Request):
     if state["setup_phase"] == "draw":
         zone_cal["home_vertices"] = [list(v) for v in zone_vertices]
         zone_cal["home_closed"]   = zone_closed
-    # Save to calibration_points with 1.0° replacement tolerance
+    # Save to calibration_points — only replace if same position within 0.6°
     if zone_closed and len(zone_vertices) >= 3:
         pan  = round(servo_angles["pan"],  1)
         tilt = round(servo_angles["tilt"], 1)
         zone_cal["calibration_points"] = [
             p for p in zone_cal["calibration_points"]
-            if not (abs(p["pan"]-pan)<1.0 and abs(p["tilt"]-tilt)<1.0)
+            if not _same_position(p, pan, tilt)
         ]
         zone_cal["calibration_points"].append({
             "pan":pan,"tilt":tilt,
@@ -686,10 +690,11 @@ async def save_forced_point(request: Request):
     data     = await request.json()
     vertices = data.get("vertices", zone_vertices)
     phase    = state["setup_phase"]
+    pan  = round(servo_angles["pan"],  1)
+    tilt = round(servo_angles["tilt"], 1)
     existing = next((p for p in zone_cal["calibration_points"]
-                     if abs(p["pan"]-round(servo_angles["pan"],1))<1.0 and
-                        abs(p["tilt"]-round(servo_angles["tilt"],1))<1.0), None)
-    point = {"pan":round(servo_angles["pan"],1),"tilt":round(servo_angles["tilt"],1),
+                     if _same_position(p, pan, tilt)), None)
+    point = {"pan":pan,"tilt":tilt,
              "vertices":[list(v) for v in vertices],"user_set":True}
     if existing: zone_cal["calibration_points"].remove(existing)
     zone_cal["calibration_points"].append(point)
@@ -711,10 +716,11 @@ async def save_forced_point(request: Request):
 async def add_extra_point(request: Request):
     data     = await request.json()
     vertices = data.get("vertices", zone_vertices)
+    pan  = round(servo_angles["pan"],  1)
+    tilt = round(servo_angles["tilt"], 1)
     existing = next((p for p in zone_cal["calibration_points"]
-                     if abs(p["pan"]-round(servo_angles["pan"],1))<1.0 and
-                        abs(p["tilt"]-round(servo_angles["tilt"],1))<1.0), None)
-    point = {"pan":round(servo_angles["pan"],1),"tilt":round(servo_angles["tilt"],1),
+                     if _same_position(p, pan, tilt)), None)
+    point = {"pan":pan,"tilt":tilt,
              "vertices":[list(v) for v in vertices],"user_set":True}
     if existing: zone_cal["calibration_points"].remove(existing)
     zone_cal["calibration_points"].append(point)
