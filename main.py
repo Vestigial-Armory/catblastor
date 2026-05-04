@@ -64,9 +64,15 @@ if CALIBRATION_FILE.exists():
 servo_angles = {"pan": 90.0, "tilt": 90.0}
 
 # ─── Home Position & Activity ─────────────────────────────────────────────────
+HOME_FILE = Path("/home/wolfhard/catblastor/home_position.json")
 home_position = {"pan": 90.0, "tilt": 90.0}
+if HOME_FILE.exists():
+    home_position.update(json.loads(HOME_FILE.read_text()))
 last_activity_time = time.time()
 HOME_TIMEOUT = 60.0  # seconds of inactivity before returning home
+
+def save_home_position():
+    HOME_FILE.write_text(json.dumps(home_position))
 
 # ─── Target Tracking State ───────────────────────────────────────────────────
 tracking = {
@@ -503,6 +509,7 @@ async def move_servos_endpoint(request: Request):
 def set_home():
     home_position["pan"]  = servo_angles["pan"]
     home_position["tilt"] = servo_angles["tilt"]
+    save_home_position()
     return {"home_pan": home_position["pan"], "home_tilt": home_position["tilt"]}
 
 @app.get("/servos/home/go")
