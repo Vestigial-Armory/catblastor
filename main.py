@@ -754,8 +754,7 @@ canvas.addEventListener('click', (e) => {
 
   if (currentMode !== 'zone_draw' || zoneClosed) return;
   zonePoints.push([x, y]);
-  drawOverlay();
-  sendZone();
+  // Don't send to backend yet — wait until zone is closed
 });
 
 function closeZone() {
@@ -765,8 +764,7 @@ function closeZone() {
   fetch('/mode/live');
   document.getElementById('btn-zone').classList.remove('active-mode');
   document.getElementById('btn-close-zone').style.display = 'none';
-  drawOverlay();
-  sendZone();
+  sendZone();  // Only send once, when closed
 }
 
 function clearZoneLocal() {
