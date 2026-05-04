@@ -12,7 +12,6 @@ import numpy as np
 import RPi.GPIO as GPIO
 import os
 import subprocess
-import struct
 from datetime import datetime
 from pathlib import Path
 
@@ -29,83 +28,40 @@ RECORDINGS_DIR.mkdir(exist_ok=True)
 HLS_DIR = Path("/tmp/catblastor_hls")
 HLS_DIR.mkdir(exist_ok=True)
 
-def start_ffmpeg_hls():
-    cmd = [
+def start_streaming():
+    """
+    rpicam-vid streams raw H264 to TCP port 8888.
+    ffmpeg picks it up and outputs HLS segments.
+    Python never touches the stream — zero CPU cost for streaming.
+    """
+    rpicam_cmd = [
+        "rpicam-vid",
+        "--width", str(FRAME_W),
+        "--height", str(FRAME_H),
+        "--framerate", "30",
+        "--bitrate", "2000000",
+        "--inline",
+        "--listen",
+        "-o", "tcp://0.0.0.0:8888",
+        "-t", "0",
+        "--nopreview",
+        "--vflip",   # camera mounted upside down
+        "--hflip",   # camera mounted upside down
+    ]
+    ffmpeg_cmd = [
         "ffmpeg", "-y",
-        "-f", "rawvideo",
-        "-pixel_format", "bgr24",
-        "-video_size", f"{FRAME_W}x{FRAME_H}",
-        "-framerate", "15",
-        "-i", "tcp://127.0.0.1:12345?listen",
-        "-vf", "format=yuv420p",
-        "-c:v", "h264_v4l2m2m",
-        "-b:v", "1000k",
-        "-g", "15",
+        "-f", "h264",
+        "-i", "tcp://127.0.0.1:8888",
+        "-c:v", "copy",
         "-f", "hls",
         "-hls_time", "0.5",
         "-hls_list_size", "4",
         "-hls_flags", "delete_segments+append_list",
         str(HLS_DIR / "stream.m3u8")
     ]
-    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-def hls_writer_loop():
-    import socket
-    # Wait for ffmpeg to start listening
-    time.sleep(2.0)
-    while True:
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect(("127.0.0.1", 12345))
-            print("HLS writer connected to ffmpeg")
-            break
-        except ConnectionRefusedError:
-            time.sleep(0.5)
-
-    while True:
-        with frame_lock:
-            if latest_frame is None:
-                time.sleep(0.01)
-                continue
-            frame = latest_frame.copy()
-
-        # Draw overlays
-        if len(state["zone_points"]) >= 2:
-            pixel_pts = [world_angle_to_pixel(p[0], p[1]) for p in state["zone_points"]]
-            pts = np.array(pixel_pts, dtype=np.int32)
-            color = (0, 255, 0) if state["zone_closed"] else (0, 255, 255)
-            cv2.polylines(frame, [pts], isClosed=state["zone_closed"], color=color, thickness=2)
-            for p in pixel_pts:
-                cv2.circle(frame, p, 5, color, -1)
-
-        with detection_lock:
-            detections = list(latest_detections)
-        for d in detections:
-            color = (0, 0, 255) if d["in_zone"] else (0, 165, 255)
-            is_primary = d["id"] == tracking["primary_target_id"]
-            thickness = 3 if is_primary else 1
-            cv2.rectangle(frame, (d["x1"], d["y1"]), (d["x2"], d["y2"]), color, thickness)
-            label = f'CAT {"[TARGET]" if is_primary else ""} {d["conf"]:.2f}'
-            cv2.putText(frame, label, (d["x1"], d["y1"]-10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-        rx, ry = calibration_state["reticle_x"], calibration_state["reticle_y"]
-        cv2.circle(frame, (rx, ry), 20, (0, 255, 255), 2)
-        cv2.line(frame, (rx-30, ry), (rx+30, ry), (0, 255, 255), 1)
-        cv2.line(frame, (rx, ry-30), (rx, ry+30), (0, 255, 255), 1)
-
-        if recording["active"]:
-            cv2.circle(frame, (20, 20), 8, (0, 0, 255), -1)
-            cv2.putText(frame, "REC", (32, 26),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-
-        try:
-            sock.sendall(frame.tobytes())
-        except (BrokenPipeError, OSError):
-            print("HLS writer disconnected, retrying...")
-            break
-
-        time.sleep(1/15)
+    subprocess.Popen(rpicam_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(2.0)  # let rpicam-vid start before ffmpeg connects
+    subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 # Mutable FOV — updated by zone drag calibration
 fov = {"h": 66.0, "v": 41.0}
@@ -483,8 +439,7 @@ threading.Thread(target=firing_loop,         daemon=True).start()
 threading.Thread(target=calibration_loop,    daemon=True).start()
 threading.Thread(target=recording_loop,      daemon=True).start()
 threading.Thread(target=home_position_loop,  daemon=True).start()
-threading.Thread(target=start_ffmpeg_hls,    daemon=True).start()
-threading.Thread(target=hls_writer_loop,     daemon=True).start()
+threading.Thread(target=start_streaming,     daemon=True).start()
 
 # ─── FastAPI ─────────────────────────────────────────────────────────────────
 app = FastAPI()
@@ -507,13 +462,23 @@ def disarm():
 def status():
     with detection_lock:
         cats = len(latest_detections)
-        in_zone = len([d for d in latest_detections if d["in_zone"]])
+        in_zone_count = len([d for d in latest_detections if d["in_zone"]])
+        dets = [
+            {
+                "x1": d["x1"], "y1": d["y1"], "x2": d["x2"], "y2": d["y2"],
+                "conf": round(d["conf"], 2),
+                "in_zone": d["in_zone"],
+                "is_primary": d["id"] == tracking["primary_target_id"]
+            }
+            for d in latest_detections
+        ]
+    # Convert zone angle points to pixel coords for overlay rendering
+    zone_px = [world_angle_to_pixel(p[0], p[1]) for p in state["zone_points"]] if state["zone_points"] else []
     return {
         "armed": state["armed"],
         "mode": state["mode"],
         "cats_detected": cats,
-        "cats_in_zone": in_zone,
-        "primary_target": tracking["primary_target_id"],
+        "cats_in_zone": in_zone_count,
         "firing": firing["active"],
         "recording": recording["active"],
         "calibration_active": calibration_state["active"],
@@ -523,6 +488,9 @@ def status():
         "tilt": servo_angles["tilt"],
         "fov_h": fov["h"],
         "fov_v": fov["v"],
+        "detections": dets,
+        "zone_px": zone_px,
+        "zone_closed": state["zone_closed"],
     }
 
 @app.post("/settings")
@@ -998,7 +966,6 @@ if (calCanvas) {
       Math.round(e.clientX - rect.left),
       Math.round(e.clientY - rect.top)
     ]);
-    drawZonePreview(calCanvas);
   });
 }
 
@@ -1009,7 +976,6 @@ canvas.addEventListener('click', (e) => {
     Math.round(e.clientX - rect.left),
     Math.round(e.clientY - rect.top)
   ]);
-  drawZonePreview(canvas);
 });
 
 function clearZoneLocal() {
@@ -1045,26 +1011,6 @@ function adjustFov(axis, delta) {
   });
 }
 
-function drawZonePreview(canvasEl) {
-  const ctx = canvasEl.getContext('2d');
-  ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
-  if (zonePoints.length === 0) return;
-  ctx.strokeStyle = '#00ffff';
-  ctx.fillStyle = '#00ffff';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(zonePoints[0][0], zonePoints[0][1]);
-  for (let i = 1; i < zonePoints.length; i++) {
-    ctx.lineTo(zonePoints[i][0], zonePoints[i][1]);
-  }
-  ctx.stroke();
-  zonePoints.forEach(p => {
-    ctx.beginPath();
-    ctx.arc(p[0], p[1], 5, 0, 2*Math.PI);
-    ctx.fill();
-  });
-}
-
 function toggleTargeting() {
   targetingActive = !targetingActive;
   const btn = document.getElementById('btn-targeting');
@@ -1094,6 +1040,84 @@ function updateSettings() {
   });
 }
 
+function drawOverlays(d) {
+  // Draw on both canvases
+  [canvas, document.getElementById('overlay-cal')].forEach(cvs => {
+    if (!cvs) return;
+    const c = cvs.getContext('2d');
+    c.clearRect(0, 0, cvs.width, cvs.height);
+
+    // Draw zone
+    if (d.zone_px && d.zone_px.length >= 2) {
+      c.strokeStyle = d.zone_closed ? '#00ff00' : '#00ffff';
+      c.lineWidth = 2;
+      c.beginPath();
+      c.moveTo(d.zone_px[0][0], d.zone_px[0][1]);
+      for (let i = 1; i < d.zone_px.length; i++) c.lineTo(d.zone_px[i][0], d.zone_px[i][1]);
+      if (d.zone_closed) c.closePath();
+      c.stroke();
+      d.zone_px.forEach(p => {
+        c.fillStyle = d.zone_closed ? '#00ff00' : '#00ffff';
+        c.beginPath();
+        c.arc(p[0], p[1], 5, 0, 2*Math.PI);
+        c.fill();
+      });
+    }
+
+    // Draw zone preview (in-progress clicks before close)
+    if (!zoneClosed && zonePoints.length > 0) {
+      c.strokeStyle = '#00ffff';
+      c.lineWidth = 2;
+      c.beginPath();
+      c.moveTo(zonePoints[0][0], zonePoints[0][1]);
+      for (let i = 1; i < zonePoints.length; i++) c.lineTo(zonePoints[i][0], zonePoints[i][1]);
+      c.stroke();
+      zonePoints.forEach(p => {
+        c.fillStyle = '#00ffff';
+        c.beginPath();
+        c.arc(p[0], p[1], 5, 0, 2*Math.PI);
+        c.fill();
+      });
+    }
+
+    // Draw detections
+    if (d.detections) {
+      d.detections.forEach(det => {
+        const color = det.in_zone ? '#ff0000' : '#ff8800';
+        c.strokeStyle = color;
+        c.lineWidth = det.is_primary ? 3 : 1;
+        c.strokeRect(det.x1, det.y1, det.x2-det.x1, det.y2-det.y1);
+        c.fillStyle = color;
+        c.font = '12px sans-serif';
+        c.fillText(`CAT${det.is_primary ? ' [TARGET]' : ''} ${det.conf}`, det.x1, det.y1 - 4);
+      });
+    }
+
+    // Draw reticle
+    const rx = d.reticle_x, ry = d.reticle_y;
+    c.strokeStyle = '#ffff00';
+    c.lineWidth = 2;
+    c.beginPath();
+    c.arc(rx, ry, 20, 0, 2*Math.PI);
+    c.stroke();
+    c.beginPath();
+    c.moveTo(rx-30, ry); c.lineTo(rx+30, ry);
+    c.moveTo(rx, ry-30); c.lineTo(rx, ry+30);
+    c.stroke();
+
+    // REC indicator
+    if (d.recording) {
+      c.fillStyle = '#ff0000';
+      c.beginPath();
+      c.arc(20, 20, 8, 0, 2*Math.PI);
+      c.fill();
+      c.fillStyle = '#ff0000';
+      c.font = 'bold 12px sans-serif';
+      c.fillText('REC', 32, 25);
+    }
+  });
+}
+
 setInterval(() => {
   fetch('/status').then(r => r.json()).then(d => {
     updateServoAngles(d.pan || 90, d.tilt || 90);
@@ -1107,8 +1131,15 @@ setInterval(() => {
     document.getElementById('txt-firing').textContent = d.firing ? '💦 FIRING' : 'Idle';
     document.getElementById('dot-rec').className = 'dot ' + (d.recording ? 'rec' : '');
     document.getElementById('txt-rec').textContent = d.recording ? '⏺ Recording' : 'Not recording';
+    if (d.fov_h) {
+      const hEl = document.getElementById('val-hfov');
+      const vEl = document.getElementById('val-vfov');
+      if (hEl) hEl.textContent = d.fov_h;
+      if (vEl) vEl.textContent = d.fov_v;
+    }
+    drawOverlays(d);
   });
-}, 500);
+}, 200);
 
 function loadRecordings() {
   fetch('/recordings').then(r => r.json()).then(d => {
