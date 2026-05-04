@@ -54,49 +54,8 @@ def save_zone_cal():
     ZONE_CAL_FILE.write_text(json.dumps(zone_cal))
 
 def interpolate_zone(pan, tilt):
-    """
-    Fit a linear model per vertex: x = a*pan + b*tilt + c, y = d*pan + e*tilt + f
-    Uses least squares regression on all calibration points.
-    Falls back to nearest-point if insufficient data.
-    """
-    pts = zone_cal["calibration_points"]
-    if not pts:
-        return None
-    if len(pts) == 1:
-        return [list(v) for v in pts[0]["vertices"]]
-
-    # Check for exact match first
-    exact = next((p for p in pts
-                  if abs(p["pan"]-pan)<0.5 and abs(p["tilt"]-tilt)<0.5), None)
-    if exact:
-        return [list(v) for v in exact["vertices"]]
-
-    n_verts = len(pts[0]["vertices"])
-
-    # Need at least 3 points for a well-constrained linear fit (3 unknowns: a,b,c)
-    if len(pts) >= 3:
-        try:
-            A = np.array([[p["pan"], p["tilt"], 1.0] for p in pts])
-            result = []
-            for i in range(n_verts):
-                bx = np.array([p["vertices"][i][0] for p in pts if i < len(p["vertices"])])
-                by = np.array([p["vertices"][i][1] for p in pts if i < len(p["vertices"])])
-                if len(bx) < 3:
-                    break
-                cx, _, _, _ = np.linalg.lstsq(A[:len(bx)], bx, rcond=None)
-                cy, _, _, _ = np.linalg.lstsq(A[:len(by)], by, rcond=None)
-                x = cx[0]*pan + cx[1]*tilt + cx[2]
-                y = cy[0]*pan + cy[1]*tilt + cy[2]
-                result.append([int(round(x)), int(round(y))])
-            if len(result) == n_verts:
-                return result
-        except Exception:
-            pass
-
-    # Fallback: nearest calibration point
-    distances = [np.sqrt((pan-p["pan"])**2+(tilt-p["tilt"])**2) for p in pts]
-    nearest = pts[int(np.argmin(distances))]
-    return [list(v) for v in nearest["vertices"]]
+    """Interpolate zone at given pan/tilt. Never modifies global state."""
+    return _interpolate_with_cal(zone_cal, pan, tilt)
 
 def get_interpolation_debug(pan, tilt):
     pts = zone_cal["calibration_points"]
@@ -117,18 +76,24 @@ def get_interpolation_debug(pan, tilt):
     return {**base, "method":"nearest_neighbor",
             "details":f"Only {len(pts)} pts — using nearest. Distances: {distances}"}
 
+loocv_counter = 0
+
 def compute_calibration_strength():
-    pts = zone_cal["calibration_points"]
+    global loocv_counter
+    # Work on a deep copy — NEVER modify zone_cal["calibration_points"] in place
+    import copy
+    pts = copy.deepcopy(zone_cal["calibration_points"])
     n = len(pts)
     if n < 3:
-        return {"position_confidence":None,"coverage_score":None,"combined":None,"n_points":n}
+        return {"position_confidence":None,"coverage_score":None,"combined":None,
+                "n_points":n,"loocv_runs":loocv_counter}
     errors = []
     for i, p in enumerate(pts):
         remaining = [pts[j] for j in range(n) if j != i]
-        original = zone_cal["calibration_points"]
-        zone_cal["calibration_points"] = remaining
-        predicted = interpolate_zone(p["pan"], p["tilt"])
-        zone_cal["calibration_points"] = original
+        # Temporarily build a fake zone_cal for interpolation
+        fake_cal = copy.deepcopy(zone_cal)
+        fake_cal["calibration_points"] = remaining
+        predicted = _interpolate_with_cal(fake_cal, p["pan"], p["tilt"])
         if predicted is None or len(predicted) != len(p["vertices"]):
             continue
         act_cx = np.mean([v[0] for v in p["vertices"]])
@@ -139,16 +104,46 @@ def compute_calibration_strength():
         xs = [v[0] for v in p["vertices"]]; ys = [v[1] for v in p["vertices"]]
         diam = max(np.sqrt((max(xs)-min(xs))**2+(max(ys)-min(ys))**2), 1.0)
         errors.append(err/diam)
+    loocv_counter += 1
     if not errors:
-        return {"position_confidence":None,"coverage_score":None,"combined":None,"n_points":n}
+        return {"position_confidence":None,"coverage_score":None,"combined":None,
+                "n_points":n,"loocv_runs":loocv_counter}
     pos_conf = max(0.0, 1.0 - np.mean(errors)) * 100.0
     pans  = [p["pan"]  for p in pts]; tilts = [p["tilt"] for p in pts]
     cov   = ((max(pans)-min(pans))/(PAN_MAX-PAN_MIN)*0.5 +
              (max(tilts)-min(tilts))/(TILT_MAX-TILT_MIN)*0.5) * 100.0
     raw   = pos_conf*0.7 + cov*0.3
-    combined = min(raw, 50.0) if n < 8 else raw
+    n_user = sum(1 for p in pts if p.get("user_set", False))
+    combined = min(raw, 50.0) if n_user < 8 else raw
     return {"position_confidence":round(pos_conf,1),"coverage_score":round(cov,1),
-            "combined":round(combined,1),"n_points":n}
+            "combined":round(combined,1),"n_points":n,"n_user_set":n_user,
+            "loocv_runs":loocv_counter}
+
+def _interpolate_with_cal(cal, pan, tilt):
+    """Interpolate zone using a specific calibration dict (for LOOCV — never uses global)."""
+    pts = cal["calibration_points"]
+    if not pts: return None
+    if len(pts) == 1: return [list(v) for v in pts[0]["vertices"]]
+    exact = next((p for p in pts
+                  if abs(p["pan"]-pan)<0.5 and abs(p["tilt"]-tilt)<0.5), None)
+    if exact: return [list(v) for v in exact["vertices"]]
+    n_verts = len(pts[0]["vertices"])
+    if len(pts) >= 3:
+        try:
+            A = np.array([[p["pan"], p["tilt"], 1.0] for p in pts])
+            result = []
+            for i in range(n_verts):
+                bx = np.array([p["vertices"][i][0] for p in pts if i < len(p["vertices"])])
+                by = np.array([p["vertices"][i][1] for p in pts if i < len(p["vertices"])])
+                if len(bx) < 3: break
+                cx, _, _, _ = np.linalg.lstsq(A[:len(bx)], bx, rcond=None)
+                cy, _, _, _ = np.linalg.lstsq(A[:len(by)], by, rcond=None)
+                result.append([int(round(float(cx[0]*pan + cx[1]*tilt + cx[2]))),
+                                int(round(float(cy[0]*pan + cy[1]*tilt + cy[2])))])
+            if len(result) == n_verts: return result
+        except Exception: pass
+    distances = [float(np.sqrt((pan-p["pan"])**2+(tilt-p["tilt"])**2)) for p in pts]
+    return [list(v) for v in pts[int(np.argmin(distances))]["vertices"]]
 
 # ─── MJPEG Streaming ─────────────────────────────────────────────────────────
 mjpeg_buffer = b""
@@ -305,17 +300,18 @@ zone_vertices = list(zone_cal.get("home_vertices", []))
 zone_closed   = bool(zone_cal.get("home_closed", False))
 
 def get_setup_zone():
-    """Return exact saved zone for current servo position, or interpolated if not saved."""
+    """Return exact saved zone for current servo position, or interpolated if not saved.
+    User-set points are NEVER replaced by interpolation."""
     pan, tilt = servo_angles["pan"], servo_angles["tilt"]
     pts = zone_cal["calibration_points"]
     if not pts:
         return zone_vertices, zone_closed, False
-    # Check for exact saved point at current position
+    # Check for exact saved point at current position (user_set or any saved)
     exact = next((p for p in pts
                   if abs(p["pan"]-pan)<0.5 and abs(p["tilt"]-tilt)<0.5), None)
     if exact:
-        return exact["vertices"], True, True  # vertices, closed, is_exact
-    # Interpolate
+        return exact["vertices"], True, True
+    # Interpolate only for unsaved positions
     interp = interpolate_zone(pan, tilt)
     if interp:
         return interp, True, False
@@ -656,7 +652,8 @@ async def setup_zone(request: Request):
         ]
         zone_cal["calibration_points"].append({
             "pan": pan, "tilt": tilt,
-            "vertices": [list(v) for v in zone_vertices]
+            "vertices": [list(v) for v in zone_vertices],
+            "user_set": True
         })
     save_zone_cal()
     return {"status":"ok","n_verts":len(zone_vertices)}
@@ -670,7 +667,8 @@ def begin_forced_cal():
         ht = round(zone_cal["home_tilt"], 1)
         zone_cal["calibration_points"] = [{
             "pan": hp, "tilt": ht,
-            "vertices": [list(v) for v in zone_vertices]}]
+            "vertices": [list(v) for v in zone_vertices],
+            "user_set": True}]
         save_zone_cal()
     state["setup_phase"] = "forced_L"
     def go():
@@ -687,8 +685,8 @@ async def save_forced_point(request: Request):
     existing = next((p for p in zone_cal["calibration_points"]
                      if abs(p["pan"]-servo_angles["pan"])<0.5 and
                         abs(p["tilt"]-servo_angles["tilt"])<0.5), None)
-    point = {"pan":servo_angles["pan"],"tilt":servo_angles["tilt"],
-             "vertices":[list(v) for v in vertices]}
+    point = {"pan":round(servo_angles["pan"],1),"tilt":round(servo_angles["tilt"],1),
+             "vertices":[list(v) for v in vertices],"user_set":True}
     if existing: zone_cal["calibration_points"].remove(existing)
     zone_cal["calibration_points"].append(point)
     save_zone_cal()
@@ -712,8 +710,8 @@ async def add_extra_point(request: Request):
     existing = next((p for p in zone_cal["calibration_points"]
                      if abs(p["pan"]-servo_angles["pan"])<0.5 and
                         abs(p["tilt"]-servo_angles["tilt"])<0.5), None)
-    point = {"pan":servo_angles["pan"],"tilt":servo_angles["tilt"],
-             "vertices":[list(v) for v in vertices]}
+    point = {"pan":round(servo_angles["pan"],1),"tilt":round(servo_angles["tilt"],1),
+             "vertices":[list(v) for v in vertices],"user_set":True}
     if existing: zone_cal["calibration_points"].remove(existing)
     zone_cal["calibration_points"].append(point)
     save_zone_cal()
@@ -1211,18 +1209,19 @@ function updStrength(data){
   const text=document.getElementById('stext');
   const pts=document.getElementById('spts');
   const n=data.n_points!==undefined?data.n_points:(s.n_points||0);
-  if(pts) pts.textContent=`${n} calibration point${n!==1?'s':''} saved`;
+  const nu=s.n_user_set||0;
+  const lr=s.loocv_runs||0;
+  if(pts) pts.textContent=`${n} saved (${nu} user-set) | LOOCV runs: ${lr}`;
   if(!fill||!text) return;
   if(s.combined!=null){
     fill.style.width=s.combined+'%';
     text.innerHTML=
       `<b style="color:#4af">Combined: ${s.combined}%</b><br>`+
-      `LOOCV Position: ${s.position_confidence}%<br>`+
-      `Coverage: ${s.coverage_score}%`+
-      (n<8?`<br><span style="color:#fa0">⚠ Add ${8-n} more point${8-n!==1?'s':''} to unlock full strength</span>`:'');
+      `LOOCV Position: ${s.position_confidence}% | Coverage: ${s.coverage_score}%`+
+      (nu<8?`<br><span style="color:#fa0">⚠ Add ${8-nu} more user-set point${8-nu!==1?'s':''} for full strength</span>`:'');
   } else {
     fill.style.width='0%';
-    text.textContent=n<3?`Need ${3-n} more point${3-n!==1?'s':''} for LOOCV assessment`:'Calculating...';
+    text.textContent=n<3?`Need ${3-n} more point${3-n!==1?'s':''} for LOOCV`:'Calculating...';
   }
 }
 
