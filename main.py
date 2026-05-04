@@ -781,21 +781,7 @@ function sendZone() {
 
 function drawOverlay() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  if (zonePoints.length >= 2) {
-    ctx.strokeStyle = '#00ff00';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(zonePoints[0][0], zonePoints[0][1]);
-    for (let i = 1; i < zonePoints.length; i++) ctx.lineTo(zonePoints[i][0], zonePoints[i][1]);
-    if (zoneClosed) ctx.closePath();
-    ctx.stroke();
-    zonePoints.forEach(p => {
-      ctx.fillStyle = '#00ff00';
-      ctx.beginPath();
-      ctx.arc(p[0], p[1], 5, 0, 2*Math.PI);
-      ctx.fill();
-    });
-  }
+  // Zone is drawn server-side in angle space — no client-side zone drawing
 }
 
 function toggleCalibration() {
