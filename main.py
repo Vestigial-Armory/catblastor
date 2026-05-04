@@ -35,7 +35,8 @@ CAM_FILE       = BASE_DIR / "camera_settings.json"
 RECORDINGS_DIR.mkdir(exist_ok=True)
 
 # ─── Camera Settings ─────────────────────────────────────────────────────────
-DEFAULT_CAM = {"brightness":0.0,"contrast":1.0,"saturation":1.0,"sharpness":1.0,"ev":0.0}
+DEFAULT_CAM = {"brightness":0.0,"contrast":1.0,"saturation":1.0,"sharpness":1.0,"ev":0.0,
+               "awb_gain_r":1.0,"awb_gain_b":1.0}
 cam_settings = dict(DEFAULT_CAM)
 if CAM_FILE.exists():
     cam_settings.update(json.loads(CAM_FILE.read_text()))
@@ -52,31 +53,69 @@ def save_zone_cal():
     ZONE_CAL_FILE.write_text(json.dumps(zone_cal))
 
 def interpolate_zone(pan, tilt):
+    """
+    Fit a linear model per vertex: x = a*pan + b*tilt + c, y = d*pan + e*tilt + f
+    Uses least squares regression on all calibration points.
+    Falls back to nearest-point if insufficient data.
+    """
     pts = zone_cal["calibration_points"]
     if not pts:
         return None
     if len(pts) == 1:
-        return pts[0]["vertices"]
-    distances = [max(np.sqrt((pan-p["pan"])**2+(tilt-p["tilt"])**2),0.001) for p in pts]
-    min_d = min(distances)
-    if min_d < 0.1:
-        return pts[distances.index(min_d)]["vertices"]
-    weights = [1.0/d**2 for d in distances]
-    total_w = sum(weights)
-    weights = [w/total_w for w in weights]
+        return [list(v) for v in pts[0]["vertices"]]
+
+    # Check for exact match first
+    exact = next((p for p in pts
+                  if abs(p["pan"]-pan)<0.5 and abs(p["tilt"]-tilt)<0.5), None)
+    if exact:
+        return [list(v) for v in exact["vertices"]]
+
     n_verts = len(pts[0]["vertices"])
-    result = []
-    for i in range(n_verts):
-        x = sum(weights[j]*pts[j]["vertices"][i][0] for j in range(len(pts)))
-        y = sum(weights[j]*pts[j]["vertices"][i][1] for j in range(len(pts)))
-        if zone_cal["depth_m"] and zone_cal["depth_m"] > 0:
-            d = zone_cal["depth_m"]
-            dpan  = np.radians(pan  - zone_cal["home_pan"])
-            dtilt = np.radians(tilt - zone_cal["home_tilt"])
-            x -= np.tan(dpan)  * d * (FRAME_W / 66.0)
-            y -= np.tan(dtilt) * d * (FRAME_H / 41.0)
-        result.append([int(round(x)), int(round(y))])
-    return result
+
+    # Need at least 3 points for a well-constrained linear fit (3 unknowns: a,b,c)
+    if len(pts) >= 3:
+        try:
+            A = np.array([[p["pan"], p["tilt"], 1.0] for p in pts])
+            result = []
+            for i in range(n_verts):
+                bx = np.array([p["vertices"][i][0] for p in pts if i < len(p["vertices"])])
+                by = np.array([p["vertices"][i][1] for p in pts if i < len(p["vertices"])])
+                if len(bx) < 3:
+                    break
+                cx, _, _, _ = np.linalg.lstsq(A[:len(bx)], bx, rcond=None)
+                cy, _, _, _ = np.linalg.lstsq(A[:len(by)], by, rcond=None)
+                x = cx[0]*pan + cx[1]*tilt + cx[2]
+                y = cy[0]*pan + cy[1]*tilt + cy[2]
+                result.append([int(round(x)), int(round(y))])
+            if len(result) == n_verts:
+                return result
+        except Exception:
+            pass
+
+    # Fallback: nearest calibration point
+    distances = [np.sqrt((pan-p["pan"])**2+(tilt-p["tilt"])**2) for p in pts]
+    nearest = pts[int(np.argmin(distances))]
+    return [list(v) for v in nearest["vertices"]]
+
+def get_interpolation_debug(pan, tilt):
+    """Return debug info about the interpolation at a given position."""
+    pts = zone_cal["calibration_points"]
+    if not pts:
+        return {"method":"no_data","details":"No calibration points"}
+    exact = next((p for p in pts
+                  if abs(p["pan"]-pan)<0.5 and abs(p["tilt"]-tilt)<0.5), None)
+    if exact:
+        return {"method":"exact","details":f"Exact match at pan={exact['pan']} tilt={exact['tilt']}"}
+    if len(pts) >= 3:
+        distances = [round(np.sqrt((pan-p["pan"])**2+(tilt-p["tilt"])**2),1) for p in pts]
+        return {
+            "method":"linear_regression",
+            "n_points":len(pts),
+            "details":f"Linear fit from {len(pts)} points. Distances: {distances}",
+            "loocv":compute_calibration_strength()
+        }
+    distances = [round(np.sqrt((pan-p["pan"])**2+(tilt-p["tilt"])**2),1) for p in pts]
+    return {"method":"nearest_neighbor","details":f"Only {len(pts)} points, using nearest. Distances: {distances}"}
 
 def compute_calibration_strength():
     pts = zone_cal["calibration_points"]
@@ -126,6 +165,7 @@ def build_rpicam_cmd():
         "--saturation", str(cam_settings["saturation"]),
         "--sharpness",  str(cam_settings["sharpness"]),
         "--ev",         str(cam_settings["ev"]),
+        "--awbgains",   f"{cam_settings['awb_gain_r']},{cam_settings['awb_gain_b']}",
     ]
 
 def start_streaming():
@@ -505,7 +545,7 @@ async def update_settings(request: Request):
 @app.post("/camera")
 async def update_camera(request: Request):
     data = await request.json()
-    for k in ["brightness","contrast","saturation","sharpness","ev"]:
+    for k in ["brightness","contrast","saturation","sharpness","ev","awb_gain_r","awb_gain_b"]:
         if k in data: cam_settings[k] = float(data[k])
     save_cam_settings()
     threading.Thread(target=restart_rpicam, daemon=True).start()
@@ -533,9 +573,18 @@ def go_home():
     move_servos(home_position["pan"],home_position["tilt"]); return {"status":"going home"}
 
 # ─── Setup Endpoints ──────────────────────────────────────────────────────────
+@app.get("/setup/interp_debug")
+def interp_debug():
+    return get_interpolation_debug(servo_angles["pan"], servo_angles["tilt"])
+
 @app.get("/setup/start")
 def setup_start():
-    state["setup_phase"] = "home"; return {"phase":"home"}
+    # If calibration points exist, resume in extra phase instead of restarting
+    if zone_cal["calibration_points"] and zone_vertices:
+        state["setup_phase"] = "extra"
+        return {"phase":"extra","resuming":True}
+    state["setup_phase"] = "home"
+    return {"phase":"home","resuming":False}
 
 @app.get("/setup/set_home")
 def setup_set_home():
@@ -668,7 +717,39 @@ def targeting_stop():
 @app.get("/recordings")
 def list_recordings():
     files = sorted(RECORDINGS_DIR.glob("*.mp4"), reverse=True)
-    return {"recordings":[f.name for f in files]}
+    result = []
+    for f in files:
+        size = f.stat().st_size
+        size_mb = round(size / 1024 / 1024, 1)
+        # Try to get duration via cv2
+        try:
+            cap = cv2.VideoCapture(str(f))
+            fps = cap.get(cv2.CAP_PROP_FPS) or 15
+            frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            cap.release()
+            duration = round(frames / fps, 1) if fps > 0 else 0
+        except Exception:
+            duration = 0
+        result.append({"name":f.name,"size_mb":size_mb,"duration_s":duration})
+    return {"recordings":result}
+
+@app.delete("/recordings/{filename}")
+def delete_recording(filename: str):
+    path = RECORDINGS_DIR / filename
+    if path.exists(): path.unlink()
+    return {"status":"deleted"}
+
+@app.post("/recordings/{filename}/rename")
+async def rename_recording(filename: str, request: Request):
+    data = await request.json()
+    new_name = data.get("name","").strip()
+    if not new_name.endswith(".mp4"): new_name += ".mp4"
+    src = RECORDINGS_DIR / filename
+    dst = RECORDINGS_DIR / new_name
+    if src.exists() and not dst.exists():
+        src.rename(dst)
+        return {"status":"renamed","name":new_name}
+    return {"status":"error"}
 
 @app.get("/recordings/{filename}")
 def get_recording(filename: str):
@@ -841,79 +922,95 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
   </div>
 
   <div id="ph-extra" class="ph" style="display:none">
-    <h3>Step 6 — Additional Calibration Points</h3>
+    <h3>Additional Calibration Points</h3>
     <p>Pan/tilt to new positions and save points. Add at least 4 more for full strength.</p>
-    <p style="font-size:0.82em;color:#888;margin-top:4px">Drag vertices to move them. Click inside zone and drag to move the whole zone.</p>
+    <p style="font-size:0.82em;color:#888;margin-top:4px">Drag vertices to adjust. Click inside zone to drag whole zone.</p>
     <div class="ctrl">
       <button class="btn y" id="btn-tgt-e" onclick="toggleTgt()">▶ Targeting</button>
       <button class="btn g" onclick="addExtraPt()">📍 Save Point Here</button>
     </div>
-    <div id="cpl-list" style="max-height:200px;overflow-y:auto;margin:6px 0"></div>
+    <div id="interp-debug" style="font-size:0.75em;color:#888;margin:4px 0;padding:4px;background:#111;border-radius:3px"></div>
+    <div id="cpl-list" style="max-height:180px;overflow-y:auto;margin:6px 0"></div>
     <div class="ctrl" style="margin-top:8px">
       <button class="btn g" onclick="setupFinish()">✓ Finish Setup</button>
       <button class="btn gr" onclick="setupReset()">Start Over</button>
     </div>
   </div>
-</div>
 
-<!-- SETTINGS -->
-<div id="settings" class="page">
-  <h2 style="margin-bottom:14px">Settings</h2>
-  <h3 style="color:#aaa;margin-bottom:8px;font-size:0.9em">Firing</h3>
-  <div class="sg" style="margin-bottom:16px">
-    <div class="set"><label>Firing Mode</label>
-      <select id="firing_mode" onchange="updSettings()">
-        <option value="single">Single Fire</option>
-        <option value="semi_auto">Semi-Auto</option>
-      </select></div>
-    <div class="set"><label>Confidence: <span class="vl" id="vl-c">0.5</span></label>
-      <input type="range" min="0.1" max="1" step="0.05" value="0.5" id="confidence_threshold"
-             oninput="document.getElementById('vl-c').textContent=this.value" onchange="updSettings()"></div>
-    <div class="set"><label>Burst Length (s): <span class="vl" id="vl-b">1.0</span></label>
-      <input type="range" min="0.1" max="5" step="0.1" value="1" id="burst_length"
-             oninput="document.getElementById('vl-b').textContent=this.value" onchange="updSettings()"></div>
-    <div class="set"><label>Reload Time (s): <span class="vl" id="vl-r">10</span></label>
-      <input type="range" min="1" max="60" step="1" value="10" id="reload_time"
-             oninput="document.getElementById('vl-r').textContent=this.value" onchange="updSettings()"></div>
-    <div class="set"><label>Semi-Auto Delay (s): <span class="vl" id="vl-s">2</span></label>
-      <input type="range" min="0.5" max="10" step="0.5" value="2" id="semi_auto_delay"
-             oninput="document.getElementById('vl-s').textContent=this.value" onchange="updSettings()"></div>
-    <div class="set"><label>On-Target Tolerance (px): <span class="vl" id="vl-t">20</span></label>
-      <input type="range" min="5" max="100" step="5" value="20" id="on_target_tolerance"
-             oninput="document.getElementById('vl-t').textContent=this.value" onchange="updSettings()"></div>
-  </div>
-  <h3 style="color:#aaa;margin-bottom:8px;font-size:0.9em">Camera</h3>
-  <div class="sg">
-    <div class="set"><label>Brightness (-1 to 1)</label>
-      <div style="display:flex;gap:6px;align-items:center">
-        <input type="range" min="-1" max="1" step="0.05" value="0" id="cam-brightness"
-               oninput="syncN('brightness',this.value)" onchange="updCam()">
-        <input type="number" id="num-brightness" value="0" step="0.05" min="-1" max="1"
-               oninput="syncS('brightness',this.value)" onchange="updCam()"></div></div>
-    <div class="set"><label>Contrast (0 to 2)</label>
-      <div style="display:flex;gap:6px;align-items:center">
-        <input type="range" min="0" max="2" step="0.05" value="1" id="cam-contrast"
-               oninput="syncN('contrast',this.value)" onchange="updCam()">
-        <input type="number" id="num-contrast" value="1" step="0.05" min="0" max="2"
-               oninput="syncS('contrast',this.value)" onchange="updCam()"></div></div>
-    <div class="set"><label>Saturation (0 to 2)</label>
-      <div style="display:flex;gap:6px;align-items:center">
-        <input type="range" min="0" max="2" step="0.05" value="1" id="cam-saturation"
-               oninput="syncN('saturation',this.value)" onchange="updCam()">
-        <input type="number" id="num-saturation" value="1" step="0.05" min="0" max="2"
-               oninput="syncS('saturation',this.value)" onchange="updCam()"></div></div>
-    <div class="set"><label>Sharpness (0 to 2)</label>
-      <div style="display:flex;gap:6px;align-items:center">
-        <input type="range" min="0" max="2" step="0.05" value="1" id="cam-sharpness"
-               oninput="syncN('sharpness',this.value)" onchange="updCam()">
-        <input type="number" id="num-sharpness" value="1" step="0.05" min="0" max="2"
-               oninput="syncS('sharpness',this.value)" onchange="updCam()"></div></div>
-    <div class="set"><label>EV Compensation (-4 to 4)</label>
-      <div style="display:flex;gap:6px;align-items:center">
-        <input type="range" min="-4" max="4" step="0.5" value="0" id="cam-ev"
-               oninput="syncN('ev',this.value)" onchange="updCam()">
-        <input type="number" id="num-ev" value="0" step="0.5" min="-4" max="4"
-               oninput="syncS('ev',this.value)" onchange="updCam()"></div></div>
+  <!-- Settings inside setup for live preview -->
+  <div id="ph-settings" class="ph" style="margin-top:8px">
+    <details open>
+      <summary style="cursor:pointer;color:#aaf;font-size:0.95em;margin-bottom:8px">⚙ Firing Settings</summary>
+      <div class="sg" style="margin-top:8px">
+        <div class="set"><label>Firing Mode</label>
+          <select id="firing_mode" onchange="updSettings()">
+            <option value="single">Single Fire</option>
+            <option value="semi_auto">Semi-Auto</option>
+          </select></div>
+        <div class="set"><label>Confidence: <span class="vl" id="vl-c">0.5</span></label>
+          <input type="range" min="0.1" max="1" step="0.05" value="0.5" id="confidence_threshold"
+                 oninput="document.getElementById('vl-c').textContent=this.value" onchange="updSettings()"></div>
+        <div class="set"><label>Burst (s): <span class="vl" id="vl-b">1.0</span></label>
+          <input type="range" min="0.1" max="5" step="0.1" value="1" id="burst_length"
+                 oninput="document.getElementById('vl-b').textContent=this.value" onchange="updSettings()"></div>
+        <div class="set"><label>Reload (s): <span class="vl" id="vl-r">10</span></label>
+          <input type="range" min="1" max="60" step="1" value="10" id="reload_time"
+                 oninput="document.getElementById('vl-r').textContent=this.value" onchange="updSettings()"></div>
+        <div class="set"><label>Semi-Auto Delay (s): <span class="vl" id="vl-s">2</span></label>
+          <input type="range" min="0.5" max="10" step="0.5" value="2" id="semi_auto_delay"
+                 oninput="document.getElementById('vl-s').textContent=this.value" onchange="updSettings()"></div>
+        <div class="set"><label>Tolerance (px): <span class="vl" id="vl-t">20</span></label>
+          <input type="range" min="5" max="100" step="5" value="20" id="on_target_tolerance"
+                 oninput="document.getElementById('vl-t').textContent=this.value" onchange="updSettings()"></div>
+      </div>
+    </details>
+    <details style="margin-top:8px">
+      <summary style="cursor:pointer;color:#aaf;font-size:0.95em;margin-bottom:8px">📷 Camera Settings</summary>
+      <div class="sg" style="margin-top:8px">
+        <div class="set"><label>Brightness (-1 to 1)</label>
+          <div style="display:flex;gap:6px;align-items:center">
+            <input type="range" min="-1" max="1" step="0.05" value="0" id="cam-brightness"
+                   oninput="syncN('brightness',this.value)" onchange="updCam()">
+            <input type="number" id="num-brightness" value="0" step="0.05" min="-1" max="1"
+                   oninput="syncS('brightness',this.value)" onchange="updCam()"></div></div>
+        <div class="set"><label>Contrast (0–2)</label>
+          <div style="display:flex;gap:6px;align-items:center">
+            <input type="range" min="0" max="2" step="0.05" value="1" id="cam-contrast"
+                   oninput="syncN('contrast',this.value)" onchange="updCam()">
+            <input type="number" id="num-contrast" value="1" step="0.05" min="0" max="2"
+                   oninput="syncS('contrast',this.value)" onchange="updCam()"></div></div>
+        <div class="set"><label>Saturation (0–2)</label>
+          <div style="display:flex;gap:6px;align-items:center">
+            <input type="range" min="0" max="2" step="0.05" value="1" id="cam-saturation"
+                   oninput="syncN('saturation',this.value)" onchange="updCam()">
+            <input type="number" id="num-saturation" value="1" step="0.05" min="0" max="2"
+                   oninput="syncS('saturation',this.value)" onchange="updCam()"></div></div>
+        <div class="set"><label>Sharpness (0–2)</label>
+          <div style="display:flex;gap:6px;align-items:center">
+            <input type="range" min="0" max="2" step="0.05" value="1" id="cam-sharpness"
+                   oninput="syncN('sharpness',this.value)" onchange="updCam()">
+            <input type="number" id="num-sharpness" value="1" step="0.05" min="0" max="2"
+                   oninput="syncS('sharpness',this.value)" onchange="updCam()"></div></div>
+        <div class="set"><label>EV Compensation (-4–4)</label>
+          <div style="display:flex;gap:6px;align-items:center">
+            <input type="range" min="-4" max="4" step="0.5" value="0" id="cam-ev"
+                   oninput="syncN('ev',this.value)" onchange="updCam()">
+            <input type="number" id="num-ev" value="0" step="0.5" min="-4" max="4"
+                   oninput="syncS('ev',this.value)" onchange="updCam()"></div></div>
+        <div class="set"><label>AWB Red Gain / Warm←→Cool (0.1–3)</label>
+          <div style="display:flex;gap:6px;align-items:center">
+            <input type="range" min="0.1" max="3" step="0.05" value="1" id="cam-awb_gain_r"
+                   oninput="syncN('awb_gain_r',this.value)" onchange="updCam()">
+            <input type="number" id="num-awb_gain_r" value="1" step="0.05" min="0.1" max="3"
+                   oninput="syncS('awb_gain_r',this.value)" onchange="updCam()"></div></div>
+        <div class="set"><label>AWB Blue Gain / Hue shift (0.1–3)</label>
+          <div style="display:flex;gap:6px;align-items:center">
+            <input type="range" min="0.1" max="3" step="0.05" value="1" id="cam-awb_gain_b"
+                   oninput="syncN('awb_gain_b',this.value)" onchange="updCam()">
+            <input type="number" id="num-awb_gain_b" value="1" step="0.05" min="0.1" max="3"
+                   oninput="syncS('awb_gain_b',this.value)" onchange="updCam()"></div></div>
+      </div>
+    </details>
   </div>
 </div>
 
@@ -1251,6 +1348,8 @@ function updCam(){
       saturation:parseFloat(document.getElementById('cam-saturation').value),
       sharpness:parseFloat(document.getElementById('cam-sharpness').value),
       ev:parseFloat(document.getElementById('cam-ev').value),
+      awb_gain_r:parseFloat(document.getElementById('cam-awb_gain_r').value),
+      awb_gain_b:parseFloat(document.getElementById('cam-awb_gain_b').value),
     })});
 }
 
@@ -1291,10 +1390,19 @@ setInterval(()=>{
     // Strength update whenever on setup page
     if(curPage==='setup'&&d.strength) updStrength({strength:d.strength,n_points:d.n_cal_points});
 
+    // Interpolation debug
+    if(curPhase==='extra'){
+      fetch('/setup/interp_debug').then(r=>r.json()).then(dbg=>{
+        const el=document.getElementById('interp-debug');
+        if(el) el.textContent=`Method: ${dbg.method} | ${dbg.details}`;
+      });
+      loadCalPoints();
+    }
+
     // Camera settings init
     if(d.cam&&!camInit){
       camInit=true;
-      ['brightness','contrast','saturation','sharpness','ev'].forEach(k=>{
+      ['brightness','contrast','saturation','sharpness','ev','awb_gain_r','awb_gain_b'].forEach(k=>{
         const s=document.getElementById('cam-'+k);
         const n=document.getElementById('num-'+k);
         if(s)s.value=d.cam[k];
@@ -1321,10 +1429,32 @@ function loadRecs(){
     const list=document.getElementById('rl');
     if(!d.recordings.length){list.innerHTML='<p style="color:#666">No recordings yet</p>';return;}
     list.innerHTML=d.recordings.map(f=>`
-      <div class="ri"><span>${f}</span>
-        <a href="/recordings/${f}" target="_blank"><button class="btn b">▶ Play</button></a>
+      <div class="ri" style="flex-direction:column;align-items:flex-start;gap:6px">
+        <div style="display:flex;justify-content:space-between;width:100%;align-items:center">
+          <span id="rn-${CSS.escape(f.name)}" style="font-size:0.9em">${f.name}</span>
+          <span style="color:#888;font-size:0.8em">${f.size_mb}MB · ${f.duration_s}s</span>
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <a href="/recordings/${f.name}" download><button class="btn b" style="padding:4px 10px;font-size:0.8em">⬇ Download</button></a>
+          <a href="/recordings/${f.name}" target="_blank"><button class="btn gr" style="padding:4px 10px;font-size:0.8em">▶ Play</button></a>
+          <button class="btn y" style="padding:4px 10px;font-size:0.8em" onclick="renameRec('${f.name}')">✏ Rename</button>
+          <button class="btn r" style="padding:4px 10px;font-size:0.8em" onclick="deleteRec('${f.name}')">✕ Delete</button>
+        </div>
       </div>`).join('');
   });
+}
+
+function deleteRec(name){
+  if(!confirm('Delete '+name+'?')) return;
+  fetch('/recordings/'+name,{method:'DELETE'}).then(()=>loadRecs());
+}
+
+function renameRec(name){
+  const newName=prompt('Rename to:',name.replace('.mp4',''));
+  if(!newName) return;
+  fetch('/recordings/'+name+'/rename',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name:newName})}).then(()=>loadRecs());
 }
 </script>
 </body>
