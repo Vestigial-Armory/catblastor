@@ -18,6 +18,7 @@ from pathlib import Path
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 FRAME_W, FRAME_H = 640, 480
+INFER_W, INFER_H = 320, 240  # lower resolution for inference — ~4x faster
 PAN_CH, TILT_CH = 0, 1
 PUMP_PIN, SOLENOID_PIN = 27, 17
 CAT_CLASS = 15
@@ -37,12 +38,8 @@ def start_ffmpeg_hls():
         "-framerate", "15",
         "-i", "tcp://127.0.0.1:12345?listen",
         "-vf", "format=yuv420p",
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-tune", "zerolatency",
-        "-profile:v", "baseline",
-        "-level", "3.0",
-        "-b:v", "800k",
+        "-c:v", "h264_v4l2m2m",
+        "-b:v", "1000k",
         "-g", "15",
         "-f", "hls",
         "-hls_time", "0.5",
@@ -285,13 +282,20 @@ def inference_loop():
             if latest_frame is None:
                 continue
             frame = latest_frame.copy()
-        results = model(frame, verbose=False)
+        # Resize to inference resolution for speed
+        small = cv2.resize(frame, (INFER_W, INFER_H))
+        results = model(small, verbose=False)
+        scale_x = FRAME_W / INFER_W
+        scale_y = FRAME_H / INFER_H
         detections = []
         for r in results[0].boxes:
             cls  = int(r.cls)
             conf = float(r.conf)
             if cls == CAT_CLASS and conf >= state["confidence_threshold"]:
                 x1, y1, x2, y2 = map(int, r.xyxy[0])
+                # Scale back to full resolution
+                x1 = int(x1 * scale_x); y1 = int(y1 * scale_y)
+                x2 = int(x2 * scale_x); y2 = int(y2 * scale_y)
                 cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
                 in_zone = (
                     point_in_angle_zone(cx, cy, state["zone_points"])
@@ -942,6 +946,10 @@ function closeZone() {
   fetch('/mode/' + baseMode);
   ['btn-zone','btn-zone-cal'].forEach(id => { const el = document.getElementById(id); if(el) el.classList.remove('active-mode'); });
   ['btn-close-zone','btn-close-zone-cal'].forEach(id => { const el = document.getElementById(id); if(el) el.style.display = 'none'; });
+  // Clear preview canvas — backend will draw the zone from now on
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const calCvs = document.getElementById('overlay-cal');
+  if (calCvs) calCvs.getContext('2d').clearRect(0, 0, calCvs.width, calCvs.height);
   sendZone();
 }
 
