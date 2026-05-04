@@ -661,6 +661,7 @@ HTML = """
   <h1>🐱 CatBlastor</h1>
   <nav>
     <button class="active" onclick="showPage('live', this)">Live</button>
+    <button onclick="showPage('calibration', this)">Calibrate</button>
     <button onclick="showPage('settings', this)">Settings</button>
     <button onclick="showPage('recordings', this)">Recordings</button>
   </nav>
@@ -687,7 +688,6 @@ HTML = """
     <button class="btn btn-blue" id="btn-zone" onclick="toggleMode('zone_draw')">Draw Zone</button>
     <button class="btn btn-gray" onclick="clearZoneLocal()">Clear Zone</button>
     <button class="btn btn-blue" id="btn-close-zone" onclick="closeZone()" style="display:none">Close Zone</button>
-    <button class="btn btn-yellow" id="btn-cal" onclick="toggleCalibration()">Calibrate</button>
     <button class="btn btn-gray" onclick="fetch('/servos/center')">Center Servos</button>
   </div>
 
@@ -699,6 +699,42 @@ HTML = """
     <button class="btn btn-gray" onclick="moveServo( 5,0)">▶ Pan Right</button>
     <button class="btn btn-gray" onclick="fetch('/servos/home/go')">🏠 Go Home</button>
     <button class="btn btn-yellow" onclick="fetch('/servos/home/set')">📌 Set Home</button>
+  </div>
+</div>
+
+<!-- CALIBRATION PAGE -->
+<div id="calibration" class="page">
+  <div id="video-container-cal">
+    <div style="position:relative;display:inline-block">
+      <img src="/stream" width="640" height="480"/>
+      <canvas id="overlay-cal" width="640" height="480" style="position:absolute;top:0;left:0;cursor:crosshair"></canvas>
+    </div>
+  </div>
+
+  <div class="controls">
+    <button class="btn btn-blue" id="btn-zone-cal" onclick="toggleMode('zone_draw')">Draw Zone</button>
+    <button class="btn btn-gray" onclick="clearZoneLocal()">Clear Zone</button>
+    <button class="btn btn-blue" id="btn-close-zone-cal" onclick="closeZone()" style="display:none">Close Zone</button>
+    <button class="btn btn-yellow" id="btn-targeting" onclick="toggleTargeting()">▶ Start Targeting</button>
+  </div>
+
+  <div class="controls" style="align-items:center">
+    <span style="color:#aaa;font-size:0.85em">Pan/Tilt:</span>
+    <button class="btn btn-gray" onclick="moveServo(0,-5)">▲ Tilt Up</button>
+    <button class="btn btn-gray" onclick="moveServo(0, 5)">▼ Tilt Down</button>
+    <button class="btn btn-gray" onclick="moveServo(-5,0)">◀ Pan Left</button>
+    <button class="btn btn-gray" onclick="moveServo( 5,0)">▶ Pan Right</button>
+    <button class="btn btn-gray" onclick="fetch('/servos/home/go')">🏠 Go Home</button>
+    <button class="btn btn-yellow" onclick="fetch('/servos/home/set')">📌 Set Home</button>
+  </div>
+
+  <div style="color:#aaa;font-size:0.8em;margin-top:8px;padding:8px;background:#1a1a1a;border-radius:4px;max-width:640px">
+    <strong style="color:#fff">How to calibrate:</strong><br>
+    1. Draw and close a zone at home position<br>
+    2. Pan/tilt to a reference point — zone should shift with camera<br>
+    3. If zone position is off, drag it to correct position<br>
+    4. Dragging updates the pixel:angle ratio automatically<br>
+    5. Use Targeting to fire and verify stream hits the zone
   </div>
 </div>
 
@@ -754,11 +790,11 @@ const ctx = canvas.getContext('2d');
 let zonePoints = [];
 let zoneClosed = false;
 let currentMode = 'live';
-let calibrationActive = false;
-let dragState = null;  // {startX, startY, panAtStart, tiltAtStart}
+let calibrationMode = false;
+let targetingActive = false;
+let dragState = null;
 let currentPan = 90, currentTilt = 90;
 
-// Track current servo angles via status polling
 function updateServoAngles(pan, tilt) {
   currentPan = pan;
   currentTilt = tilt;
@@ -777,119 +813,113 @@ function showPage(page, btn) {
   document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
   document.getElementById(page).classList.add('active');
   btn.classList.add('active');
+  calibrationMode = (page === 'calibration');
+  if (!calibrationMode && targetingActive) {
+    targetingActive = false;
+    fetch('/calibration/stop');
+    document.getElementById('btn-targeting').textContent = '▶ Start Targeting';
+    document.getElementById('btn-targeting').classList.remove('active-mode');
+  }
+  fetch('/mode/' + (calibrationMode ? 'calibration' : 'live'));
   if (page === 'recordings') loadRecordings();
 }
 
 function toggleMode(mode) {
+  const baseMode = calibrationMode ? 'calibration' : 'live';
   if (currentMode === mode) {
-    currentMode = 'live';
-    fetch('/mode/live');
-    document.getElementById('btn-zone').classList.remove('active-mode');
-    document.getElementById('btn-close-zone').style.display = 'none';
+    currentMode = baseMode;
+    fetch('/mode/' + baseMode);
+    ['btn-zone','btn-zone-cal'].forEach(id => { const el = document.getElementById(id); if(el) el.classList.remove('active-mode'); });
+    ['btn-close-zone','btn-close-zone-cal'].forEach(id => { const el = document.getElementById(id); if(el) el.style.display = 'none'; });
   } else {
     currentMode = mode;
     fetch('/mode/' + mode);
-    document.getElementById('btn-zone').classList.add('active-mode');
-    document.getElementById('btn-close-zone').style.display = 'inline-block';
+    ['btn-zone','btn-zone-cal'].forEach(id => { const el = document.getElementById(id); if(el) el.classList.add('active-mode'); });
+    ['btn-close-zone','btn-close-zone-cal'].forEach(id => { const el = document.getElementById(id); if(el) el.style.display = 'inline-block'; });
   }
 }
-
-canvas.addEventListener('mousedown', (e) => {
-  const rect = canvas.getBoundingClientRect();
-  const x = Math.round(e.clientX - rect.left);
-  const y = Math.round(e.clientY - rect.top);
-  if (calibrationActive && zoneClosed) {
-    dragState = {startX: x, startY: y, panAtStart: currentPan, tiltAtStart: currentTilt};
-  }
-});
-
-canvas.addEventListener('mouseup', (e) => {
-  if (!dragState || !calibrationActive) { dragState = null; return; }
-  const rect = canvas.getBoundingClientRect();
-  const x = Math.round(e.clientX - rect.left);
-  const y = Math.round(e.clientY - rect.top);
-  const dx = x - dragState.startX;
-  const dy = y - dragState.startY;
-  if (Math.abs(dx) > 2 || Math.abs(dy) > 2) {
-    fetch('/zone/drag', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        dx, dy,
-        pan_delta:  currentPan  - dragState.panAtStart,
-        tilt_delta: currentTilt - dragState.tiltAtStart,
-      })
-    });
-  }
-  dragState = null;
-});
-
-canvas.addEventListener('click', (e) => {
-  const rect = canvas.getBoundingClientRect();
-  const x = Math.round(e.clientX - rect.left);
-  const y = Math.round(e.clientY - rect.top);
-
-  // In calibration mode with closed zone — drag handled by mouseup, click moves reticle
-  if (calibrationActive && zoneClosed) return;
-
-  // Reticle placement in calibration mode without closed zone
-  if (calibrationActive && !zoneClosed) {
-    fetch('/calibration/reticle', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({x, y})
-    });
-    return;
-  }
-
-  // Zone drawing
-  if (currentMode !== 'zone_draw' || zoneClosed) return;
-  zonePoints.push([x, y]);
-});
 
 function closeZone() {
   if (zonePoints.length < 3) return;
   zoneClosed = true;
-  currentMode = 'live';
-  fetch('/mode/live');
-  document.getElementById('btn-zone').classList.remove('active-mode');
-  document.getElementById('btn-close-zone').style.display = 'none';
-  sendZone();  // Only send once, when closed
+  const baseMode = calibrationMode ? 'calibration' : 'live';
+  currentMode = baseMode;
+  fetch('/mode/' + baseMode);
+  ['btn-zone','btn-zone-cal'].forEach(id => { const el = document.getElementById(id); if(el) el.classList.remove('active-mode'); });
+  ['btn-close-zone','btn-close-zone-cal'].forEach(id => { const el = document.getElementById(id); if(el) el.style.display = 'none'; });
+  sendZone();
 }
 
-function clearZoneLocal() {
-  zonePoints = [];
-  zoneClosed = false;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  fetch('/zone/clear');
-}
+// ── Calibration canvas drag ──────────────────────────────────────────────────
+const calCanvas = document.getElementById('overlay-cal');
+if (calCanvas) {
+  const calCtx = calCanvas.getContext('2d');
 
-function sendZone() {
-  fetch('/zone', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({points: zonePoints, closed: zoneClosed})
+  calCanvas.addEventListener('mousedown', (e) => {
+    if (!zoneClosed) return;
+    const rect = calCanvas.getBoundingClientRect();
+    dragState = {
+      startX: Math.round(e.clientX - rect.left),
+      startY: Math.round(e.clientY - rect.top),
+      panAtStart: currentPan,
+      tiltAtStart: currentTilt
+    };
+  });
+
+  calCanvas.addEventListener('mouseup', (e) => {
+    if (!dragState) return;
+    const rect = calCanvas.getBoundingClientRect();
+    const x = Math.round(e.clientX - rect.left);
+    const y = Math.round(e.clientY - rect.top);
+    const dx = x - dragState.startX;
+    const dy = y - dragState.startY;
+    if (Math.abs(dx) > 2 || Math.abs(dy) > 2) {
+      fetch('/zone/drag', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          dx, dy,
+          pan_delta:  currentPan  - dragState.panAtStart,
+          tilt_delta: currentTilt - dragState.tiltAtStart,
+        })
+      });
+    }
+    dragState = null;
+  });
+
+  calCanvas.addEventListener('click', (e) => {
+    if (zoneClosed) return;  // drag handles zone interaction
+    if (currentMode !== 'zone_draw') return;
+    const rect = calCanvas.getBoundingClientRect();
+    zonePoints.push([
+      Math.round(e.clientX - rect.left),
+      Math.round(e.clientY - rect.top)
+    ]);
   });
 }
 
-function drawOverlay() {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  // Zone is drawn server-side in angle space — no client-side zone drawing
-}
+canvas.addEventListener('click', (e) => {
+  if (currentMode !== 'zone_draw' || zoneClosed) return;
+  const rect = canvas.getBoundingClientRect();
+  zonePoints.push([
+    Math.round(e.clientX - rect.left),
+    Math.round(e.clientY - rect.top)
+  ]);
+});
 
-function toggleCalibration() {
-  calibrationActive = !calibrationActive;
-  const btn = document.getElementById('btn-cal');
-  if (calibrationActive) {
+function clearZoneLocal() {
+
+function toggleTargeting() {
+  targetingActive = !targetingActive;
+  const btn = document.getElementById('btn-targeting');
+  if (targetingActive) {
     fetch('/calibration/start');
+    btn.textContent = '⏹ Stop Targeting';
     btn.classList.add('active-mode');
-    btn.textContent = 'Stop Calibration';
-    canvas.style.cursor = 'crosshair';
   } else {
     fetch('/calibration/stop');
+    btn.textContent = '▶ Start Targeting';
     btn.classList.remove('active-mode');
-    btn.textContent = 'Calibrate';
-    canvas.style.cursor = 'crosshair';
   }
 }
 
