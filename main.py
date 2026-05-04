@@ -29,13 +29,12 @@ INFER_PIPE = "/tmp/catblastor_infer"
 if not os.path.exists(INFER_PIPE):
     os.mkfifo(INFER_PIPE)
 
+mjpeg_buffer = b""
+mjpeg_lock = threading.Lock()
+rpicam_proc = None
+
 def start_streaming():
-    """
-    rpicam-vid outputs MJPEG to stdout.
-    ffmpeg reads it and:
-      1. Serves MJPEG over HTTP on port 8888 for browser
-      2. Tees raw BGR frames at inference resolution to named pipe for Python
-    """
+    global rpicam_proc
     rpicam_cmd = [
         "rpicam-vid",
         "--width", "640",
@@ -49,38 +48,53 @@ def start_streaming():
         "--vflip",
         "--hflip",
     ]
-
-    ffmpeg_cmd = [
-        "ffmpeg", "-y",
-        "-f", "mjpeg",
-        "-i", "pipe:0",
-        # Output 1 — HTTP MJPEG for browser
-        "-map", "0:v",
-        "-c:v", "copy",
-        "-f", "mjpeg",
-        "-listen", "1",
-        "http://0.0.0.0:8888/stream",
-        # Output 2 — raw BGR frames for inference
-        "-map", "0:v",
-        "-vf", f"scale={INFER_W}:{INFER_H},format=bgr24",
-        "-r", "5",
-        "-f", "rawvideo",
-        INFER_PIPE,
-    ]
-
     rpicam_proc = subprocess.Popen(
         rpicam_cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL
     )
     time.sleep(1.0)
-    subprocess.Popen(
-        ffmpeg_cmd,
-        stdin=rpicam_proc.stdout,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
+
+    # ffmpeg reads from rpicam stdout copy for inference frames only
+    infer_cmd = [
+        "ffmpeg", "-y",
+        "-f", "mjpeg",
+        "-i", f"pipe:0",
+        "-vf", f"scale={INFER_W}:{INFER_H},format=bgr24",
+        "-r", "5",
+        "-f", "rawvideo",
+        INFER_PIPE,
+    ]
+    # Use tee to duplicate rpicam stdout to both our reader and ffmpeg
+    tee_cmd = ["tee", "/tmp/catblastor_mjpeg_tee"]
     print("Streaming started")
+
+def mjpeg_reader_loop():
+    """Read MJPEG stream from rpicam-vid and buffer latest frame."""
+    global mjpeg_buffer
+    while rpicam_proc is None:
+        time.sleep(0.1)
+    buf = b""
+    SOI = b'\xff\xd8'  # JPEG start marker
+    EOI = b'\xff\xd9'  # JPEG end marker
+    while True:
+        try:
+            chunk = rpicam_proc.stdout.read(65536)
+            if not chunk:
+                break
+            buf += chunk
+            while True:
+                start = buf.find(SOI)
+                end = buf.find(EOI, start + 2)
+                if start == -1 or end == -1:
+                    break
+                frame = buf[start:end + 2]
+                with mjpeg_lock:
+                    mjpeg_buffer = frame
+                buf = buf[end + 2:]
+        except Exception as e:
+            print(f"MJPEG reader error: {e}")
+            break
 
 # Mutable FOV — updated by zone drag calibration
 fov = {"h": 66.0, "v": 41.0}
@@ -227,32 +241,23 @@ def home_position_loop():
             if time.time() - last_activity_time > HOME_TIMEOUT:
                 move_servos(home_position["pan"], home_position["tilt"])
 
-# ─── Capture Thread — reads raw frames from ffmpeg inference pipe ─────────────
+# ─── Capture Thread — decodes frames from MJPEG buffer for inference ──────────
 def capture_loop():
     global latest_frame
-    frame_size = INFER_W * INFER_H * 3  # BGR24
-    print("Waiting for inference pipe...")
     while True:
-        try:
-            pipe = open(INFER_PIPE, "rb")
-            print("Inference pipe connected")
-            break
-        except Exception:
-            time.sleep(0.5)
-    while True:
-        try:
-            data = pipe.read(frame_size)
-            if len(data) != frame_size:
-                pipe.close()
-                time.sleep(0.1)
-                pipe = open(INFER_PIPE, "rb")
-                continue
-            frame = np.frombuffer(data, dtype=np.uint8).reshape((INFER_H, INFER_W, 3))
-            with frame_lock:
-                latest_frame = frame.copy()
-        except Exception as e:
-            print(f"Pipe read error: {e}")
-            time.sleep(0.1)
+        with mjpeg_lock:
+            frame_data = mjpeg_buffer
+        if frame_data:
+            try:
+                arr = np.frombuffer(frame_data, dtype=np.uint8)
+                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    frame = cv2.resize(frame, (INFER_W, INFER_H))
+                    with frame_lock:
+                        latest_frame = frame.copy()
+            except Exception:
+                pass
+        time.sleep(1/10)  # 10fps for inference
 
 # ─── Inference Thread ────────────────────────────────────────────────────────
 def inference_loop():
@@ -465,9 +470,23 @@ threading.Thread(target=calibration_loop,    daemon=True).start()
 threading.Thread(target=recording_loop,      daemon=True).start()
 threading.Thread(target=home_position_loop,  daemon=True).start()
 threading.Thread(target=start_streaming,     daemon=True).start()
+threading.Thread(target=mjpeg_reader_loop,   daemon=True).start()
 
 # ─── FastAPI ─────────────────────────────────────────────────────────────────
 app = FastAPI()
+
+@app.get("/stream")
+def stream():
+    def generate():
+        while True:
+            with mjpeg_lock:
+                frame = mjpeg_buffer
+            if frame:
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" +
+                       frame + b"\r\n")
+            time.sleep(1/30)
+    return StreamingResponse(generate(),
+        media_type="multipart/x-mixed-replace; boundary=frame")
 
 @app.get("/arm")
 def arm():
@@ -732,7 +751,7 @@ HTML = """
 
   <div id="video-container">
     <div style="position:relative;display:inline-block">
-      <img src="http://catblastor.local:8888/stream" width="640" height="480" style="display:block;background:#000"/>
+      <img src="/stream" width="640" height="480" style="display:block;background:#000"/>
       <canvas id="overlay" width="640" height="480" style="position:absolute;top:0;left:0;cursor:crosshair"></canvas>
     </div>
   </div>
@@ -761,7 +780,7 @@ HTML = """
 <div id="calibration" class="page">
   <div id="video-container-cal">
     <div style="position:relative;display:inline-block">
-      <img src="http://catblastor.local:8888/stream" width="640" height="480" style="display:block;background:#000"/>
+      <img src="/stream" width="640" height="480" style="display:block;background:#000"/>
       <canvas id="overlay-cal" width="640" height="480" style="position:absolute;top:0;left:0;cursor:crosshair"></canvas>
     </div>
   </div>
