@@ -15,13 +15,21 @@ from pathlib import Path
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 FRAME_W, FRAME_H = 640, 480
-H_FOV, V_FOV = 66.0, 41.0
 PAN_CH, TILT_CH = 0, 1
 PUMP_PIN, SOLENOID_PIN = 27, 17
 CAT_CLASS = 15
 RECORDINGS_DIR = Path("/home/wolfhard/catblastor/recordings")
 CALIBRATION_FILE = Path("/home/wolfhard/catblastor/calibration.json")
+FOV_FILE = Path("/home/wolfhard/catblastor/fov_calibration.json")
 RECORDINGS_DIR.mkdir(exist_ok=True)
+
+# Mutable FOV — updated by zone drag calibration
+fov = {"h": 66.0, "v": 41.0}
+if FOV_FILE.exists():
+    fov.update(json.loads(FOV_FILE.read_text()))
+
+def save_fov():
+    FOV_FILE.write_text(json.dumps(fov))
 
 # ─── GPIO Setup ──────────────────────────────────────────────────────────────
 GPIO.setmode(GPIO.BCM)
@@ -119,22 +127,18 @@ def point_in_polygon(cx, cy, polygon):
     return cv2.pointPolygonTest(pts, (float(cx), float(cy)), False) >= 0
 
 def pixel_to_angle(cx, cy):
-    # Negate because camera is mounted upside down
-    pan  = 90.0 - ((cx - FRAME_W / 2) / FRAME_W) * H_FOV
-    tilt = 90.0 - ((cy - FRAME_H / 2) / FRAME_H) * V_FOV
+    pan  = 90.0 - ((cx - FRAME_W / 2) / FRAME_W) * fov["h"]
+    tilt = 90.0 - ((cy - FRAME_H / 2) / FRAME_H) * fov["v"]
     return clamp(pan, 45, 135), clamp(tilt, 45, 135)
 
 def pixel_to_world_angle(cx, cy):
-    """Convert pixel position to absolute world angle using current servo position."""
-    # Negate offsets because camera is mounted upside down and image is flipped
-    pan  = servo_angles["pan"]  - ((cx - FRAME_W / 2) / FRAME_W) * H_FOV
-    tilt = servo_angles["tilt"] - ((cy - FRAME_H / 2) / FRAME_H) * V_FOV
+    pan  = servo_angles["pan"]  - ((cx - FRAME_W / 2) / FRAME_W) * fov["h"]
+    tilt = servo_angles["tilt"] - ((cy - FRAME_H / 2) / FRAME_H) * fov["v"]
     return pan, tilt
 
 def world_angle_to_pixel(pan, tilt):
-    """Convert world angle back to pixel position based on current servo position."""
-    cx = int(-(pan  - servo_angles["pan"])  / H_FOV * FRAME_W + FRAME_W / 2)
-    cy = int(-(tilt - servo_angles["tilt"]) / V_FOV * FRAME_H + FRAME_H / 2)
+    cx = int(-(pan  - servo_angles["pan"])  / fov["h"] * FRAME_W + FRAME_W / 2)
+    cy = int(-(tilt - servo_angles["tilt"]) / fov["v"] * FRAME_H + FRAME_H / 2)
     return cx, cy
     """Check if pixel position falls inside zone defined in angle space."""
     if len(zone_points) < 3:
@@ -462,6 +466,10 @@ def status():
         "calibration_active": calibration_state["active"],
         "reticle_x": calibration_state["reticle_x"],
         "reticle_y": calibration_state["reticle_y"],
+        "pan": servo_angles["pan"],
+        "tilt": servo_angles["tilt"],
+        "fov_h": fov["h"],
+        "fov_v": fov["v"],
     }
 
 @app.post("/settings")
@@ -486,7 +494,49 @@ async def set_zone(request: Request):
     state["zone_closed"] = data.get("closed", False)
     return {"status": "zone updated"}
 
-@app.get("/zone/clear")
+@app.post("/zone/drag")
+async def drag_zone(request: Request):
+    """
+    User dragged zone by (dx, dy) pixels in calibration mode.
+    Use the drag to recalculate FOV scaling factors and shift zone points.
+    """
+    data = await request.json()
+    dx = data.get("dx", 0)
+    dy = data.get("dy", 0)
+    pan_delta  = data.get("pan_delta",  0)  # how much servo moved since zone was drawn
+    tilt_delta = data.get("tilt_delta", 0)
+
+    if len(state["zone_points"]) < 3 or not state["zone_closed"]:
+        return {"status": "no closed zone"}
+
+    # If servo has moved and user is correcting zone position,
+    # use the drag offset to recalibrate FOV
+    if abs(pan_delta) > 0.5 and abs(dx) > 2:
+        # Expected pixel shift = pan_delta / fov["h"] * FRAME_W
+        # Actual pixel shift = dx
+        # New fov["h"] = pan_delta / (dx / FRAME_W)
+        new_h = abs(pan_delta) / (abs(dx) / FRAME_W)
+        fov["h"] = round(clamp(new_h, 20.0, 120.0), 2)
+
+    if abs(tilt_delta) > 0.5 and abs(dy) > 2:
+        new_v = abs(tilt_delta) / (abs(dy) / FRAME_H)
+        fov["v"] = round(clamp(new_v, 10.0, 80.0), 2)
+
+    save_fov()
+
+    # Shift all zone points by the drag amount converted to angle offset
+    pan_shift  = (dx / FRAME_W) * fov["h"]
+    tilt_shift = (dy / FRAME_H) * fov["v"]
+    state["zone_points"] = [
+        [p[0] - pan_shift, p[1] - tilt_shift]
+        for p in state["zone_points"]
+    ]
+
+    return {"status": "zone dragged", "fov_h": fov["h"], "fov_v": fov["v"]}
+
+@app.get("/fov")
+def get_fov():
+    return {"h": fov["h"], "v": fov["v"]}
 def clear_zone():
     state["zone_points"] = []
     state["zone_closed"] = False
@@ -707,6 +757,14 @@ let zonePoints = [];
 let zoneClosed = false;
 let currentMode = 'live';
 let calibrationActive = false;
+let dragState = null;  // {startX, startY, panAtStart, tiltAtStart}
+let currentPan = 90, currentTilt = 90;
+
+// Track current servo angles via status polling
+function updateServoAngles(pan, tilt) {
+  currentPan = pan;
+  currentTilt = tilt;
+}
 
 function moveServo(pan_delta, tilt_delta) {
   fetch('/servos/move', {
@@ -738,12 +796,42 @@ function toggleMode(mode) {
   }
 }
 
+canvas.addEventListener('mousedown', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const x = Math.round(e.clientX - rect.left);
+  const y = Math.round(e.clientY - rect.top);
+  if (calibrationActive && zoneClosed) {
+    dragState = {startX: x, startY: y, panAtStart: currentPan, tiltAtStart: currentTilt};
+  }
+});
+
+canvas.addEventListener('mouseup', (e) => {
+  if (!dragState || !calibrationActive) { dragState = null; return; }
+  const rect = canvas.getBoundingClientRect();
+  const x = Math.round(e.clientX - rect.left);
+  const y = Math.round(e.clientY - rect.top);
+  const dx = x - dragState.startX;
+  const dy = y - dragState.startY;
+  if (Math.abs(dx) > 2 || Math.abs(dy) > 2) {
+    fetch('/zone/drag', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        dx, dy,
+        pan_delta:  currentPan  - dragState.panAtStart,
+        tilt_delta: currentTilt - dragState.tiltAtStart,
+      })
+    });
+  }
+  dragState = null;
+});
+
 canvas.addEventListener('click', (e) => {
   const rect = canvas.getBoundingClientRect();
   const x = Math.round(e.clientX - rect.left);
   const y = Math.round(e.clientY - rect.top);
 
-  if (calibrationActive) {
+  if (calibrationActive && !zoneClosed) {
     fetch('/calibration/reticle', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -754,7 +842,6 @@ canvas.addEventListener('click', (e) => {
 
   if (currentMode !== 'zone_draw' || zoneClosed) return;
   zonePoints.push([x, y]);
-  // Don't send to backend yet — wait until zone is closed
 });
 
 function closeZone() {
@@ -820,6 +907,7 @@ function updateSettings() {
 
 setInterval(() => {
   fetch('/status').then(r => r.json()).then(d => {
+    updateServoAngles(d.pan || 90, d.tilt || 90);
     document.getElementById('dot-armed').className = 'dot ' + (d.armed ? 'on' : '');
     document.getElementById('txt-armed').textContent = d.armed ? 'Armed' : 'Disarmed';
     document.getElementById('dot-cats').className = 'dot ' + (d.cats_detected > 0 ? 'warn' : '');
