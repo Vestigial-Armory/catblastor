@@ -1,6 +1,5 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
 from adafruit_servokit import ServoKit
 import cv2
@@ -25,27 +24,25 @@ CALIBRATION_FILE = Path("/home/wolfhard/catblastor/calibration.json")
 FOV_FILE = Path("/home/wolfhard/catblastor/fov_calibration.json")
 INFER_PIPE = "/tmp/catblastor_infer"
 RECORDINGS_DIR.mkdir(exist_ok=True)
-HLS_DIR = Path("/tmp/catblastor_hls")
-HLS_DIR.mkdir(exist_ok=True)
 INFER_PIPE = "/tmp/catblastor_infer"
 
-# Create inference pipe
 if not os.path.exists(INFER_PIPE):
     os.mkfifo(INFER_PIPE)
 
 def start_streaming():
     """
-    rpicam-vid streams H264 to TCP.
-    ffmpeg reads it and outputs:
-      1. HLS segments for browser
-      2. Raw BGR frames at 320x240 to a named pipe for Python inference
+    rpicam-vid outputs MJPEG directly to TCP:8080 — browser loads as img src.
+    ffmpeg separately grabs from rpicam-vid and outputs raw frames to inference pipe.
+    Two separate rpicam-vid instances can't share camera, so we use one rpicam-vid
+    for MJPEG and ffmpeg to decode and pipe frames for inference.
     """
-    rpicam_cmd = [
+    # MJPEG stream direct from camera hardware
+    mjpeg_cmd = [
         "rpicam-vid",
         "--width", "640",
         "--height", "480",
         "--framerate", "30",
-        "--bitrate", "2000000",
+        "--codec", "mjpeg",
         "--inline",
         "--listen",
         "-o", "tcp://0.0.0.0:8888",
@@ -55,37 +52,19 @@ def start_streaming():
         "--hflip",
     ]
 
-    ffmpeg_cmd = [
+    # ffmpeg reads MJPEG stream and outputs raw frames for inference
+    infer_cmd = [
         "ffmpeg", "-y",
-        "-f", "h264",
         "-i", "tcp://127.0.0.1:8888",
-        # Output 1 — HLS for browser (copy H264, no re-encode)
-        "-map", "0:v",
-        "-c:v", "copy",
-        "-f", "hls",
-        "-hls_time", "0.5",
-        "-hls_list_size", "4",
-        "-hls_flags", "delete_segments+append_list",
-        str(HLS_DIR / "stream.m3u8"),
-        # Output 2 — raw BGR frames at inference resolution for Python
-        "-map", "0:v",
-        "-vf", "scale=320:240,format=bgr24",
-        "-r", "5",  # 5fps is plenty for inference
+        "-vf", f"scale={INFER_W}:{INFER_H},format=bgr24",
+        "-r", "5",
         "-f", "rawvideo",
         INFER_PIPE,
     ]
 
-    proc_cam = subprocess.Popen(
-        rpicam_cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
+    subprocess.Popen(mjpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2.0)
-    proc_ffmpeg = subprocess.Popen(
-        ffmpeg_cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
+    subprocess.Popen(infer_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print("Streaming started")
 
 # Mutable FOV — updated by zone drag calibration
@@ -474,7 +453,20 @@ threading.Thread(target=start_streaming,     daemon=True).start()
 
 # ─── FastAPI ─────────────────────────────────────────────────────────────────
 app = FastAPI()
-app.mount("/hls", StaticFiles(directory=str(HLS_DIR)), name="hls")
+
+@app.get("/stream")
+def stream():
+    """Proxy the MJPEG stream from rpicam-vid to the browser."""
+    import socket
+    def generate():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect(("127.0.0.1", 8888))
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            yield chunk
+    return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 @app.get("/arm")
 def arm():
@@ -739,7 +731,7 @@ HTML = """
 
   <div id="video-container">
     <div style="position:relative;display:inline-block">
-      <video id="video" width="640" height="480" autoplay muted playsinline style="display:block;background:#000"></video>
+      <img src="/stream" width="640" height="480" style="display:block;background:#000"/>
       <canvas id="overlay" width="640" height="480" style="position:absolute;top:0;left:0;cursor:crosshair"></canvas>
     </div>
   </div>
@@ -768,7 +760,7 @@ HTML = """
 <div id="calibration" class="page">
   <div id="video-container-cal">
     <div style="position:relative;display:inline-block">
-      <video id="video-cal" width="640" height="480" autoplay muted playsinline style="display:block;background:#000"></video>
+      <img src="/stream" width="640" height="480" style="display:block;background:#000"/>
       <canvas id="overlay-cal" width="640" height="480" style="position:absolute;top:0;left:0;cursor:crosshair"></canvas>
     </div>
   </div>
@@ -861,22 +853,7 @@ HTML = """
   <div class="recordings-list" id="recordings-list">Loading...</div>
 </div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.4.12/hls.min.js"></script>
 <script>
-// ── HLS Video Setup ──────────────────────────────────────────────────────────
-function setupHLS(videoId) {
-  const video = document.getElementById(videoId);
-  if (!video) return;
-  if (Hls.isSupported()) {
-    const hls = new Hls({lowLatencyMode: true, liveSyncDurationCount: 1});
-    hls.loadSource('/hls/stream.m3u8');
-    hls.attachMedia(video);
-  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    video.src = '/hls/stream.m3u8';
-  }
-}
-setupHLS('video');
-setupHLS('video-cal');
 const canvas = document.getElementById('overlay');
 const ctx = canvas.getContext('2d');
 let zonePoints = [];
