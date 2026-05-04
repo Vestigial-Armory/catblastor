@@ -547,7 +547,7 @@ def begin_forced_cal():
     state["setup_phase"] = "forced_L"
     def go():
         time.sleep(0.5)
-        move_servos(PAN_MIN, zone_cal["home_tilt"], slow=True)
+        move_servos(PAN_MAX, zone_cal["home_tilt"], slow=True)  # PAN_MAX = visual left (camera flipped)
     threading.Thread(target=go, daemon=True).start()
     return {"phase":"forced_L"}
 
@@ -570,7 +570,7 @@ async def save_forced_point(request: Request):
     state["setup_phase"] = next_phase
     def go():
         time.sleep(0.3)
-        if phase == "forced_L":   move_servos(PAN_MAX,             zone_cal["home_tilt"], slow=True)
+        if phase == "forced_L":   move_servos(PAN_MIN,             zone_cal["home_tilt"], slow=True)  # PAN_MIN = visual right
         elif phase == "forced_R": move_servos(zone_cal["home_pan"], TILT_MIN,              slow=True)
         elif phase == "forced_up":move_servos(zone_cal["home_pan"], TILT_MAX,              slow=True)
         elif phase == "forced_down": move_servos(zone_cal["home_pan"], zone_cal["home_tilt"], slow=True)
@@ -756,21 +756,33 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
 
 <!-- SETUP -->
 <div id="setup" class="page">
-  <div class="vw">
-    <img src="/stream" width="640" height="480" style="display:block;background:#000">
-    <canvas id="ov-setup" width="640" height="480" style="cursor:crosshair"></canvas>
-  </div>
-  <div class="ctrl" style="gap:20px;margin-top:6px">
-    <div class="sbar-wrap">Pan:<span id="pp-s">0%</span><div class="sbar"><div class="sind" id="pi-s" style="left:50%"></div></div></div>
-    <div class="sbar-wrap">Tilt:<span id="tp-s">0%</span><div class="sbar"><div class="sind" id="ti-s" style="left:50%"></div></div></div>
-  </div>
-  <div class="ctrl">
-    <span style="color:#aaa;font-size:0.85em">Pan/Tilt:</span>
-    <button class="btn gr" onclick="mv(0,-5)">▲</button>
-    <button class="btn gr" onclick="mv(0,5)">▼</button>
-    <button class="btn gr" onclick="mv(-5,0)">◀</button>
-    <button class="btn gr" onclick="mv(5,0)">▶</button>
-    <button class="btn gr" onclick="fetch('/servos/home/go')">🏠 Go Home</button>
+  <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap">
+    <div>
+      <div class="vw">
+        <img src="/stream" width="640" height="480" style="display:block;background:#000">
+        <canvas id="ov-setup" width="640" height="480" style="cursor:crosshair"></canvas>
+      </div>
+      <div class="ctrl" style="gap:20px;margin-top:6px">
+        <div class="sbar-wrap">Pan:<span id="pp-s">0%</span><div class="sbar"><div class="sind" id="pi-s" style="left:50%"></div></div></div>
+        <div class="sbar-wrap">Tilt:<span id="tp-s">0%</span><div class="sbar"><div class="sind" id="ti-s" style="left:50%"></div></div></div>
+      </div>
+      <div class="ctrl">
+        <span style="color:#aaa;font-size:0.85em">Pan/Tilt:</span>
+        <button class="btn gr" onclick="mv(0,-5)">▲</button>
+        <button class="btn gr" onclick="mv(0,5)">▼</button>
+        <button class="btn gr" onclick="mv(-5,0)">◀</button>
+        <button class="btn gr" onclick="mv(5,0)">▶</button>
+        <button class="btn gr" onclick="fetch('/servos/home/go')">🏠 Go Home</button>
+      </div>
+    </div>
+    <div style="min-width:220px;max-width:260px">
+      <div style="background:#1a1a2a;border:1px solid #334;border-radius:6px;padding:12px">
+        <strong style="font-size:0.9em;color:#aaf">Calibration Strength</strong>
+        <div class="sbar2" style="margin:8px 0"><div class="sf" id="sfill" style="width:0%"></div></div>
+        <div style="font-size:0.78em;color:#aaa;line-height:1.6" id="stext">Insufficient data</div>
+        <div style="font-size:0.78em;color:#888;margin-top:4px" id="spts">0 points saved</div>
+      </div>
+    </div>
   </div>
 
   <div id="ph-home" class="ph" style="display:none">
@@ -782,10 +794,10 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
 
   <div id="ph-draw" class="ph" style="display:none">
     <h3>Step 2 of 6 — Draw Forbidden Zone</h3>
-    <p>Click to place vertices. Use mode buttons to add, move or delete vertices.</p>
+    <p>Click to place vertices. Close zone when done, then begin calibration.</p>
     <div class="ctrl">
       <button class="btn b on" id="btn-add" onclick="vmode('add')">+ Add</button>
-      <button class="btn b" id="btn-mv" onclick="vmode('move')">↔ Move</button>
+      <button class="btn b" id="btn-mv" onclick="toggleVertMode()">↔ Move Vertices</button>
       <button class="btn r" id="btn-del" onclick="vmode('delete')">✕ Delete</button>
       <button class="btn gr" onclick="clearZone()">Clear All</button>
       <button class="btn y" id="btn-cz" onclick="closeZone()" disabled>Close Zone</button>
@@ -800,7 +812,7 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
     <h3 id="ftitle">Forced Calibration</h3>
     <p id="fmsg"></p>
     <div class="ctrl">
-      <button class="btn b" onclick="vmode('move')">↔ Move Vertices</button>
+      <button class="btn b" id="btn-mv" onclick="toggleVertMode()">↔ Move Vertices</button>
       <button class="btn y" id="btn-tgt" onclick="toggleTgt()">▶ Targeting</button>
     </div>
     <div style="margin:8px 0;font-size:0.85em">
@@ -816,14 +828,9 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
     <h3>Step 6 — Additional Calibration Points</h3>
     <p>Pan/tilt to new positions and save points. Add at least 4 more for full strength.</p>
     <div class="ctrl">
-      <button class="btn b" onclick="vmode('move')">↔ Move Vertices</button>
+      <button class="btn b" id="btn-mv-e" onclick="toggleVertMode()">↔ Move Vertices</button>
       <button class="btn y" id="btn-tgt-e" onclick="toggleTgt()">▶ Targeting</button>
       <button class="btn g" onclick="addExtraPt()">📍 Save Point Here</button>
-    </div>
-    <div style="margin:8px 0">
-      <strong style="font-size:0.9em">Calibration Strength</strong>
-      <div class="sbar2"><div class="sf" id="sfill" style="width:0%"></div></div>
-      <div style="font-size:0.8em;color:#aaa" id="stext">Insufficient data</div>
     </div>
     <div id="cpl-list" style="max-height:200px;overflow-y:auto;margin:6px 0"></div>
     <div class="ctrl" style="margin-top:8px">
@@ -957,14 +964,14 @@ function applyPhase(phase){
     vmode('add');
   } else if(['forced_L','forced_R','forced_up','forced_down'].includes(phase)){
     document.getElementById('ph-forced').style.display='block';
-    const T={forced_L:'Step 3 of 6 — Left Pan Endpoint',
-             forced_R:'Step 4 of 6 — Right Pan Endpoint',
+    const T={forced_L:'Step 3 of 6 — Left Pan Endpoint (visual left)',
+             forced_R:'Step 4 of 6 — Right Pan Endpoint (visual right)',
              forced_up:'Step 5a of 6 — Tilt Up Endpoint',
              forced_down:'Step 5b of 6 — Tilt Down Endpoint'};
-    const M={forced_L:'Camera moved to left pan limit. If zone is off-screen, pan right until visible, then drag vertices.',
-             forced_R:'Camera moved to right pan limit. If zone is off-screen, pan left until visible, then drag vertices.',
-             forced_up:'Camera moved to tilt up limit. Drag vertices to correct zone position.',
-             forced_down:'Camera moved to tilt down limit. Drag vertices to correct position. Camera returns home when done.'};
+    const M={forced_L:'Camera moved to visual left limit. If zone is off-screen, pan right until visible, then drag zone or vertices to correct position.',
+             forced_R:'Camera moved to visual right limit. If zone is off-screen, pan left until visible, then drag zone or vertices to correct position.',
+             forced_up:'Camera tilted up to limit. Drag zone or vertices to correct position.',
+             forced_down:'Camera tilted down to limit. Drag zone or vertices to correct position. Camera returns home when done.'};
     document.getElementById('ftitle').textContent=T[phase]||phase;
     document.getElementById('fmsg').textContent=M[phase]||'';
     document.getElementById('btn-df').textContent=
@@ -1010,12 +1017,17 @@ function updStrength(data){
   const s=data.strength||{};
   const fill=document.getElementById('sfill');
   const text=document.getElementById('stext');
+  const pts=document.getElementById('spts');
   const n=data.n_points||s.n_points||0;
-  if(fill&&s.combined!=null){
-    fill.style.width=s.combined+'%';
-    text.textContent=`Combined: ${s.combined}% | Position: ${s.position_confidence}% | Coverage: ${s.coverage_score}% | Points: ${n}`;
-  } else if(text){
-    text.textContent=`${n} point(s) — need 3+ for strength metric`;
+  if(pts) pts.textContent=`${n} calibration point${n!==1?'s':''} saved`;
+  if(fill){
+    if(s.combined!=null){
+      fill.style.width=s.combined+'%';
+      if(text) text.textContent=`Combined: ${s.combined}% | Position: ${s.position_confidence}% | Coverage: ${s.coverage_score}%`;
+    } else {
+      fill.style.width='0%';
+      if(text) text.textContent=`${n} point(s) — need 3+ for strength metric`;
+    }
   }
 }
 
@@ -1045,12 +1057,11 @@ function removeCalPt(idx){
 // ── Vertex Mode ────────────────────────────────────────────────────────────
 function vmode(m){
   vMode=m;
-  ['btn-add','btn-mv','btn-del'].forEach(id=>{
+  ['btn-add','btn-del'].forEach(id=>{
     const el=document.getElementById(id);if(el)el.classList.remove('on');
   });
-  const map={add:'btn-add',move:'btn-mv',delete:'btn-del'};
+  const map={add:'btn-add',delete:'btn-del'};
   const el=document.getElementById(map[m]);if(el)el.classList.add('on');
-  document.getElementById('ov-setup').style.cursor=m==='move'?'grab':'crosshair';
 }
 
 function updDrawBtns(){
@@ -1067,27 +1078,74 @@ function sendZone(){
 
 // ── Setup Canvas ───────────────────────────────────────────────────────────
 const sc=document.getElementById('ov-setup');
+let vertMode = false;  // false = whole-zone drag, true = vertex drag
+let zoneDrag = false;
+let zoneDragStart = null;
+let zoneDragOrigin = null;
+
+function toggleVertMode(){
+  vertMode = !vertMode;
+  const btn = document.getElementById('btn-mv');
+  if(btn){
+    btn.textContent = vertMode ? '↔ Vertex Mode ON' : '↔ Move Vertices';
+    vertMode ? btn.classList.add('on') : btn.classList.remove('on');
+  }
+  sc.style.cursor = vertMode ? 'crosshair' : (zClosed ? 'grab' : 'crosshair');
+}
+
+function ptInZone(x, y){
+  if(verts.length < 3) return false;
+  let inside = false;
+  for(let i=0,j=verts.length-1;i<verts.length;j=i++){
+    const xi=verts[i][0],yi=verts[i][1],xj=verts[j][0],yj=verts[j][1];
+    if(((yi>y)!=(yj>y))&&(x<(xj-xi)*(y-yi)/(yj-yi)+xi)) inside=!inside;
+  }
+  return inside;
+}
 
 sc.addEventListener('mousedown',e=>{
   const r=sc.getBoundingClientRect();
   const x=Math.round(e.clientX-r.left),y=Math.round(e.clientY-r.top);
-  if(vMode==='add'&&!zClosed){verts.push([x,y]);sendZone();updDrawBtns();}
-  else if(vMode==='delete'){
+  if(vMode==='add'&&!zClosed&&!vertMode){
+    verts.push([x,y]);
+    sendZone();
+    updDrawBtns();
+    return;
+  }
+  if(vMode==='delete'&&!vertMode){
     const i=nearV(x,y,15);
     if(i>=0){verts.splice(i,1);if(verts.length<3)zClosed=false;sendZone();updDrawBtns();}
-  } else if(vMode==='move'){
+    return;
+  }
+  if(vertMode){
+    // vertex drag mode
     dragIdx=nearV(x,y,20);
     if(dragIdx>=0){dragOff={x:x-verts[dragIdx][0],y:y-verts[dragIdx][1]};sc.style.cursor='grabbing';}
+  } else if(zClosed){
+    // whole zone drag
+    if(ptInZone(x,y)||nearV(x,y,15)>=0){
+      zoneDrag=true;
+      zoneDragStart={x,y};
+      zoneDragOrigin=verts.map(v=>[v[0],v[1]]);
+      sc.style.cursor='grabbing';
+    }
   }
 });
+
 sc.addEventListener('mousemove',e=>{
-  if(dragIdx<0)return;
   const r=sc.getBoundingClientRect();
   const x=Math.round(e.clientX-r.left),y=Math.round(e.clientY-r.top);
-  verts[dragIdx]=[x-dragOff.x,y-dragOff.y];
+  if(vertMode&&dragIdx>=0){
+    verts[dragIdx]=[x-dragOff.x,y-dragOff.y];
+  } else if(zoneDrag&&zoneDragStart&&zoneDragOrigin){
+    const dx=x-zoneDragStart.x, dy=y-zoneDragStart.y;
+    verts=zoneDragOrigin.map(v=>[v[0]+dx,v[1]+dy]);
+  }
 });
+
 sc.addEventListener('mouseup',()=>{
-  if(dragIdx>=0){sendZone();dragIdx=-1;sc.style.cursor='grab';}
+  if(vertMode&&dragIdx>=0){sendZone();dragIdx=-1;sc.style.cursor='crosshair';}
+  else if(zoneDrag){sendZone();zoneDrag=false;zoneDragStart=null;zoneDragOrigin=null;sc.style.cursor='grab';}
 });
 
 function nearV(x,y,thresh){
@@ -1109,10 +1167,11 @@ function drawOvs(d){
     const ctx=c.getContext('2d');
     ctx.clearRect(0,0,c.width,c.height);
 
-    // Zone
-    const zv = useServer?(d.zone_px||[]):verts;
-    const zc = useServer?d.zone_closed:zClosed;
-    if(zv.length>=2) drawZone(ctx,zv,zc,zc?'#00ff00':'#00ffff');
+    // Zone — in draw phase always use local verts; in other phases use server zone_px
+    const useLocal = (curPhase==='draw') || (!zClosed && verts.length>0);
+    const zv = useLocal ? verts : (id==='ov-live' ? (d.zone_px||[]) : (verts.length>0?verts:(d.zone_px||[])));
+    const zc = useLocal ? zClosed : d.zone_closed;
+    if(zv.length>=1) drawZone(ctx,zv,zc,zc?'#00ff00':'#00ffff');
 
     // Off-screen arrow
     if(useServer&&zv.length>0){
@@ -1206,8 +1265,8 @@ setInterval(()=>{
     // Phase sync
     if(d.setup_phase!==curPhase&&curPage==='setup') applyPhase(d.setup_phase);
 
-    // Strength update in extra phase
-    if(curPhase==='extra'&&d.strength) updStrength({strength:d.strength,n_points:d.n_cal_points});
+    // Strength update whenever on setup page
+    if(curPage==='setup'&&d.strength) updStrength({strength:d.strength,n_points:d.n_cal_points});
 
     // Camera settings init
     if(d.cam&&!camInit){
