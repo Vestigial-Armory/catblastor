@@ -266,7 +266,7 @@ def select_target(detections):
 # ─── Servo Tracking Thread ───────────────────────────────────────────────────
 def servo_tracking_loop():
     while True:
-        if not state["armed"]:
+        if not state["armed"] or state["mode"] == "calibration":
             time.sleep(0.05)
             continue
         with detection_lock:
@@ -282,7 +282,7 @@ def servo_tracking_loop():
 # ─── Firing Thread ───────────────────────────────────────────────────────────
 def firing_loop():
     while True:
-        if not state["armed"]:
+        if not state["armed"] or state["mode"] == "calibration":
             GPIO.output(PUMP_PIN, GPIO.LOW)
             GPIO.output(SOLENOID_PIN, GPIO.LOW)
             firing["active"] = False
@@ -335,11 +335,15 @@ def _fire_burst():
 def calibration_loop():
     while True:
         if calibration_state["active"]:
+            # Pump runs, solenoid pulses for stream calibration
             GPIO.output(PUMP_PIN, GPIO.HIGH)
+            time.sleep(0.5)  # let pump prime
             GPIO.output(SOLENOID_PIN, GPIO.HIGH)
             time.sleep(1.0)
             GPIO.output(SOLENOID_PIN, GPIO.LOW)
             time.sleep(1.0)
+            GPIO.output(PUMP_PIN, GPIO.LOW)
+            time.sleep(0.5)
         else:
             GPIO.output(PUMP_PIN, GPIO.LOW)
             GPIO.output(SOLENOID_PIN, GPIO.LOW)
@@ -496,35 +500,29 @@ async def set_zone(request: Request):
 
 @app.post("/zone/drag")
 async def drag_zone(request: Request):
-    """
-    User dragged zone by (dx, dy) pixels in calibration mode.
-    Use the drag to recalculate FOV scaling factors and shift zone points.
-    """
     data = await request.json()
     dx = data.get("dx", 0)
     dy = data.get("dy", 0)
-    pan_delta  = data.get("pan_delta",  0)  # how much servo moved since zone was drawn
+    pan_delta  = data.get("pan_delta",  0)
     tilt_delta = data.get("tilt_delta", 0)
+
+    print(f"Zone drag: dx={dx} dy={dy} pan_delta={pan_delta:.2f} tilt_delta={tilt_delta:.2f} fov={fov}")
 
     if len(state["zone_points"]) < 3 or not state["zone_closed"]:
         return {"status": "no closed zone"}
 
-    # If servo has moved and user is correcting zone position,
-    # use the drag offset to recalibrate FOV
     if abs(pan_delta) > 0.5 and abs(dx) > 2:
-        # Expected pixel shift = pan_delta / fov["h"] * FRAME_W
-        # Actual pixel shift = dx
-        # New fov["h"] = pan_delta / (dx / FRAME_W)
         new_h = abs(pan_delta) / (abs(dx) / FRAME_W)
         fov["h"] = round(clamp(new_h, 20.0, 120.0), 2)
+        print(f"Updated H_FOV to {fov['h']}")
 
     if abs(tilt_delta) > 0.5 and abs(dy) > 2:
         new_v = abs(tilt_delta) / (abs(dy) / FRAME_H)
         fov["v"] = round(clamp(new_v, 10.0, 80.0), 2)
+        print(f"Updated V_FOV to {fov['v']}")
 
     save_fov()
 
-    # Shift all zone points by the drag amount converted to angle offset
     pan_shift  = (dx / FRAME_W) * fov["h"]
     tilt_shift = (dy / FRAME_H) * fov["v"]
     state["zone_points"] = [
@@ -831,6 +829,10 @@ canvas.addEventListener('click', (e) => {
   const x = Math.round(e.clientX - rect.left);
   const y = Math.round(e.clientY - rect.top);
 
+  // In calibration mode with closed zone — drag handled by mouseup, click moves reticle
+  if (calibrationActive && zoneClosed) return;
+
+  // Reticle placement in calibration mode without closed zone
   if (calibrationActive && !zoneClosed) {
     fetch('/calibration/reticle', {
       method: 'POST',
@@ -840,6 +842,7 @@ canvas.addEventListener('click', (e) => {
     return;
   }
 
+  // Zone drawing
   if (currentMode !== 'zone_draw' || zoneClosed) return;
   zonePoints.push([x, y]);
 });
