@@ -16,461 +16,417 @@ from pathlib import Path
 # ─── Constants ───────────────────────────────────────────────────────────────
 FRAME_W, FRAME_H = 640, 480
 INFER_W, INFER_H = 320, 240
-PAN_CH, TILT_CH = 0, 1
+PAN_CH, TILT_CH  = 0, 1
 PUMP_PIN, SOLENOID_PIN = 27, 17
-CAT_CLASS = 15
-RECORDINGS_DIR = Path("/home/wolfhard/catblastor/recordings")
-CALIBRATION_FILE = Path("/home/wolfhard/catblastor/calibration.json")
-FOV_FILE = Path("/home/wolfhard/catblastor/fov_calibration.json")
-INFER_PIPE = "/tmp/catblastor_infer"
+CAT_CLASS  = 15
+PAN_MIN,  PAN_MAX  = 45.0, 135.0
+TILT_MIN, TILT_MAX = 45.0, 135.0
+PAN_CENTER  = (PAN_MIN  + PAN_MAX)  / 2
+TILT_CENTER = (TILT_MIN + TILT_MAX) / 2
+PAN_RANGE   = PAN_MAX  - PAN_CENTER
+TILT_RANGE  = TILT_MAX - TILT_CENTER
+
+BASE_DIR       = Path("/home/wolfhard/catblastor")
+RECORDINGS_DIR = BASE_DIR / "recordings"
+ZONE_CAL_FILE  = BASE_DIR / "zone_calibration.json"
+HOME_FILE      = BASE_DIR / "home_position.json"
+SETTINGS_FILE  = BASE_DIR / "settings.json"
+CAM_FILE       = BASE_DIR / "camera_settings.json"
 RECORDINGS_DIR.mkdir(exist_ok=True)
-INFER_PIPE = "/tmp/catblastor_infer"
 
-if not os.path.exists(INFER_PIPE):
-    os.mkfifo(INFER_PIPE)
+# ─── Camera Settings ─────────────────────────────────────────────────────────
+DEFAULT_CAM = {"brightness":0.0,"contrast":1.0,"saturation":1.0,"sharpness":1.0,"ev":0.0}
+cam_settings = dict(DEFAULT_CAM)
+if CAM_FILE.exists():
+    cam_settings.update(json.loads(CAM_FILE.read_text()))
 
+def save_cam_settings():
+    CAM_FILE.write_text(json.dumps(cam_settings))
+
+# ─── Zone Calibration ────────────────────────────────────────────────────────
+zone_cal = {"home_pan":90.0,"home_tilt":90.0,"depth_m":None,"calibration_points":[]}
+if ZONE_CAL_FILE.exists():
+    zone_cal.update(json.loads(ZONE_CAL_FILE.read_text()))
+
+def save_zone_cal():
+    ZONE_CAL_FILE.write_text(json.dumps(zone_cal))
+
+def interpolate_zone(pan, tilt):
+    pts = zone_cal["calibration_points"]
+    if not pts:
+        return None
+    if len(pts) == 1:
+        return pts[0]["vertices"]
+    distances = [max(np.sqrt((pan-p["pan"])**2+(tilt-p["tilt"])**2),0.001) for p in pts]
+    min_d = min(distances)
+    if min_d < 0.1:
+        return pts[distances.index(min_d)]["vertices"]
+    weights = [1.0/d**2 for d in distances]
+    total_w = sum(weights)
+    weights = [w/total_w for w in weights]
+    n_verts = len(pts[0]["vertices"])
+    result = []
+    for i in range(n_verts):
+        x = sum(weights[j]*pts[j]["vertices"][i][0] for j in range(len(pts)))
+        y = sum(weights[j]*pts[j]["vertices"][i][1] for j in range(len(pts)))
+        if zone_cal["depth_m"] and zone_cal["depth_m"] > 0:
+            d = zone_cal["depth_m"]
+            dpan  = np.radians(pan  - zone_cal["home_pan"])
+            dtilt = np.radians(tilt - zone_cal["home_tilt"])
+            x -= np.tan(dpan)  * d * (FRAME_W / 66.0)
+            y -= np.tan(dtilt) * d * (FRAME_H / 41.0)
+        result.append([int(round(x)), int(round(y))])
+    return result
+
+def compute_calibration_strength():
+    pts = zone_cal["calibration_points"]
+    n = len(pts)
+    if n < 3:
+        return {"position_confidence":None,"coverage_score":None,"combined":None,"n_points":n}
+    errors = []
+    for i, p in enumerate(pts):
+        remaining = [pts[j] for j in range(n) if j != i]
+        original = zone_cal["calibration_points"]
+        zone_cal["calibration_points"] = remaining
+        predicted = interpolate_zone(p["pan"], p["tilt"])
+        zone_cal["calibration_points"] = original
+        if predicted is None or len(predicted) != len(p["vertices"]):
+            continue
+        act_cx = np.mean([v[0] for v in p["vertices"]])
+        act_cy = np.mean([v[1] for v in p["vertices"]])
+        pre_cx = np.mean([v[0] for v in predicted])
+        pre_cy = np.mean([v[1] for v in predicted])
+        err = np.sqrt((act_cx-pre_cx)**2+(act_cy-pre_cy)**2)
+        xs = [v[0] for v in p["vertices"]]; ys = [v[1] for v in p["vertices"]]
+        diam = max(np.sqrt((max(xs)-min(xs))**2+(max(ys)-min(ys))**2), 1.0)
+        errors.append(err/diam)
+    if not errors:
+        return {"position_confidence":None,"coverage_score":None,"combined":None,"n_points":n}
+    pos_conf = max(0.0, 1.0 - np.mean(errors)) * 100.0
+    pans  = [p["pan"]  for p in pts]; tilts = [p["tilt"] for p in pts]
+    cov   = ((max(pans)-min(pans))/(PAN_MAX-PAN_MIN)*0.5 +
+             (max(tilts)-min(tilts))/(TILT_MAX-TILT_MIN)*0.5) * 100.0
+    raw   = pos_conf*0.7 + cov*0.3
+    combined = min(raw, 50.0) if n < 8 else raw
+    return {"position_confidence":round(pos_conf,1),"coverage_score":round(cov,1),
+            "combined":round(combined,1),"n_points":n}
+
+# ─── MJPEG Streaming ─────────────────────────────────────────────────────────
 mjpeg_buffer = b""
-mjpeg_lock = threading.Lock()
-rpicam_proc = None
+mjpeg_lock   = threading.Lock()
+rpicam_proc  = None
+
+def build_rpicam_cmd():
+    return [
+        "rpicam-vid","--width","640","--height","480","--framerate","30",
+        "--codec","mjpeg","--inline","-o","-","-t","0","--nopreview",
+        "--vflip","--hflip",
+        "--brightness", str(cam_settings["brightness"]),
+        "--contrast",   str(cam_settings["contrast"]),
+        "--saturation", str(cam_settings["saturation"]),
+        "--sharpness",  str(cam_settings["sharpness"]),
+        "--ev",         str(cam_settings["ev"]),
+    ]
 
 def start_streaming():
     global rpicam_proc
-    rpicam_cmd = [
-        "rpicam-vid",
-        "--width", "640",
-        "--height", "480",
-        "--framerate", "30",
-        "--codec", "mjpeg",
-        "--inline",
-        "-o", "-",
-        "-t", "0",
-        "--nopreview",
-        "--vflip",
-        "--hflip",
-    ]
-    rpicam_proc = subprocess.Popen(
-        rpicam_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL
-    )
-    time.sleep(1.0)
-
-    # ffmpeg reads from rpicam stdout copy for inference frames only
-    infer_cmd = [
-        "ffmpeg", "-y",
-        "-f", "mjpeg",
-        "-i", f"pipe:0",
-        "-vf", f"scale={INFER_W}:{INFER_H},format=bgr24",
-        "-r", "5",
-        "-f", "rawvideo",
-        INFER_PIPE,
-    ]
-    # Use tee to duplicate rpicam stdout to both our reader and ffmpeg
-    tee_cmd = ["tee", "/tmp/catblastor_mjpeg_tee"]
+    rpicam_proc = subprocess.Popen(build_rpicam_cmd(),
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     print("Streaming started")
 
+def restart_rpicam():
+    global rpicam_proc
+    if rpicam_proc:
+        rpicam_proc.terminate()
+        rpicam_proc.wait()
+    rpicam_proc = subprocess.Popen(build_rpicam_cmd(),
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
 def mjpeg_reader_loop():
-    """Read MJPEG stream from rpicam-vid and buffer latest frame."""
     global mjpeg_buffer
     while rpicam_proc is None:
         time.sleep(0.1)
     buf = b""
-    SOI = b'\xff\xd8'  # JPEG start marker
-    EOI = b'\xff\xd9'  # JPEG end marker
+    SOI, EOI = b'\xff\xd8', b'\xff\xd9'
     while True:
         try:
             chunk = rpicam_proc.stdout.read(65536)
             if not chunk:
-                break
+                time.sleep(0.1); continue
             buf += chunk
             while True:
-                start = buf.find(SOI)
-                end = buf.find(EOI, start + 2)
-                if start == -1 or end == -1:
-                    break
-                frame = buf[start:end + 2]
+                s = buf.find(SOI); e = buf.find(EOI, s+2)
+                if s == -1 or e == -1: break
                 with mjpeg_lock:
-                    mjpeg_buffer = frame
-                buf = buf[end + 2:]
-        except Exception as e:
-            print(f"MJPEG reader error: {e}")
-            break
+                    mjpeg_buffer = buf[s:e+2]
+                buf = buf[e+2:]
+        except Exception as ex:
+            print(f"MJPEG reader: {ex}"); time.sleep(0.1)
 
-# Mutable FOV — updated by zone drag calibration
-fov = {"h": 66.0, "v": 41.0}
-if FOV_FILE.exists():
-    fov.update(json.loads(FOV_FILE.read_text()))
-
-def save_fov():
-    FOV_FILE.write_text(json.dumps(fov))
-
-# ─── GPIO Setup ──────────────────────────────────────────────────────────────
+# ─── GPIO ────────────────────────────────────────────────────────────────────
 GPIO.setmode(GPIO.BCM)
-GPIO.setup(PUMP_PIN, GPIO.OUT)
-GPIO.setup(SOLENOID_PIN, GPIO.OUT)
-GPIO.output(PUMP_PIN, GPIO.LOW)
-GPIO.output(SOLENOID_PIN, GPIO.LOW)
+GPIO.setup(PUMP_PIN,     GPIO.OUT); GPIO.output(PUMP_PIN,     GPIO.LOW)
+GPIO.setup(SOLENOID_PIN, GPIO.OUT); GPIO.output(SOLENOID_PIN, GPIO.LOW)
 
-# ─── Hardware Init ───────────────────────────────────────────────────────────
+# ─── Servo Hardware ──────────────────────────────────────────────────────────
 kit = ServoKit(channels=16)
-kit.servo[PAN_CH].angle = 90
+kit.servo[PAN_CH].angle  = 90
 kit.servo[TILT_CH].angle = 90
 
+# ─── YOLO ────────────────────────────────────────────────────────────────────
 model = YOLO("yolov8n.pt")
 
-# ─── State ───────────────────────────────────────────────────────────────────
+# ─── App State ───────────────────────────────────────────────────────────────
 state = {
-    "armed": False,
-    "mode": "live",           # live | zone_draw | calibration
-    "firing_mode": "single",  # single | semi_auto
-    "burst_length": 1.0,
-    "reload_time": 10.0,
-    "semi_auto_delay": 2.0,
-    "confidence_threshold": 0.5,
-    "on_target_tolerance": 20,
-    "zone_points": [],
-    "zone_closed": False,
+    "armed":False,"firing_mode":"single","burst_length":1.0,
+    "reload_time":10.0,"semi_auto_delay":2.0,"confidence_threshold":0.5,
+    "on_target_tolerance":20,"setup_phase":None,
 }
+if SETTINGS_FILE.exists():
+    saved = json.loads(SETTINGS_FILE.read_text())
+    for k in ["firing_mode","burst_length","reload_time","semi_auto_delay",
+               "confidence_threshold","on_target_tolerance"]:
+        if k in saved: state[k] = saved[k]
 
-calibration = {"offset_x": 0, "offset_y": 0}
-if CALIBRATION_FILE.exists():
-    calibration.update(json.loads(CALIBRATION_FILE.read_text()))
+def save_settings():
+    SETTINGS_FILE.write_text(json.dumps({k:state[k] for k in
+        ["firing_mode","burst_length","reload_time","semi_auto_delay",
+         "confidence_threshold","on_target_tolerance"]}))
 
-servo_angles = {"pan": 90.0, "tilt": 90.0}
-
-# ─── Home Position & Activity ─────────────────────────────────────────────────
-HOME_FILE = Path("/home/wolfhard/catblastor/home_position.json")
-home_position = {"pan": 90.0, "tilt": 90.0}
+# ─── Servo State ─────────────────────────────────────────────────────────────
+servo_angles = {"pan":90.0,"tilt":90.0}
+home_position = {"pan":90.0,"tilt":90.0}
 if HOME_FILE.exists():
     home_position.update(json.loads(HOME_FILE.read_text()))
 last_activity_time = time.time()
-HOME_TIMEOUT = 60.0  # seconds of inactivity before returning home
+HOME_TIMEOUT = 60.0
 
 def save_home_position():
     HOME_FILE.write_text(json.dumps(home_position))
 
-# ─── Target Tracking State ───────────────────────────────────────────────────
-tracking = {
-    "primary_target_id": None,
-    "target_entry_times": {},
-    "last_seen": {},
-    "locked": False,
-}
-
-firing = {
-    "active": False,
-    "last_fire_time": 0,
-}
-
-# ─── Shared Frame Data ───────────────────────────────────────────────────────
-frame_lock = threading.Lock()
-latest_frame = None
-latest_detections = []
-detection_lock = threading.Lock()
-
-# ─── Recording State ─────────────────────────────────────────────────────────
-recording = {
-    "active": False,
-    "writer": None,
-    "last_detection_time": 0,
-    "filename": None,
-}
-
-# ─── Calibration State ───────────────────────────────────────────────────────
-calibration_state = {
-    "active": False,
-    "reticle_x": FRAME_W // 2,
-    "reticle_y": FRAME_H // 2,
-}
-
-# ─── Helpers ─────────────────────────────────────────────────────────────────
 def clamp(val, lo, hi):
     return max(lo, min(hi, val))
 
-def point_in_polygon(cx, cy, polygon):
-    if len(polygon) < 3:
-        return False
-    pts = np.array(polygon, dtype=np.int32)
-    return cv2.pointPolygonTest(pts, (float(cx), float(cy)), False) >= 0
-
-def pixel_to_angle(cx, cy):
-    pan  = 90.0 - ((cx - FRAME_W / 2) / FRAME_W) * fov["h"]
-    tilt = 90.0 - ((cy - FRAME_H / 2) / FRAME_H) * fov["v"]
-    return clamp(pan, 45, 135), clamp(tilt, 45, 135)
-
-def pixel_to_world_angle(cx, cy):
-    pan  = servo_angles["pan"]  - ((cx - FRAME_W / 2) / FRAME_W) * fov["h"]
-    tilt = servo_angles["tilt"] - ((cy - FRAME_H / 2) / FRAME_H) * fov["v"]
-    return pan, tilt
-
-def world_angle_to_pixel(pan, tilt):
-    cx = int(-(pan  - servo_angles["pan"])  / fov["h"] * FRAME_W + FRAME_W / 2)
-    cy = int(-(tilt - servo_angles["tilt"]) / fov["v"] * FRAME_H + FRAME_H / 2)
-    return cx, cy
-
-def point_in_angle_zone(cx, cy, zone_points):
-    if len(zone_points) < 3:
-        return False
-    pan, tilt = pixel_to_world_angle(cx, cy)
-    pts = np.array(zone_points, dtype=np.float32)
-    return cv2.pointPolygonTest(pts, (float(pan), float(tilt)), False) >= 0
-
-def move_servos(pan, tilt):
+def move_servos(pan, tilt, slow=False):
     global last_activity_time
-    kit.servo[PAN_CH].angle  = clamp(pan,  45, 135)
-    kit.servo[TILT_CH].angle = clamp(tilt, 45, 135)
-    servo_angles["pan"]  = pan
-    servo_angles["tilt"] = tilt
+    pan  = clamp(pan,  PAN_MIN,  PAN_MAX)
+    tilt = clamp(tilt, TILT_MIN, TILT_MAX)
+    if slow:
+        cp, ct = servo_angles["pan"], servo_angles["tilt"]
+        steps = max(int(abs(pan-cp)/2), int(abs(tilt-ct)/2), 1)
+        for i in range(1, steps+1):
+            p = cp + (pan-cp)*i/steps; t = ct + (tilt-ct)*i/steps
+            kit.servo[PAN_CH].angle  = p
+            kit.servo[TILT_CH].angle = t
+            servo_angles["pan"] = p; servo_angles["tilt"] = t
+            time.sleep(0.02)
+    else:
+        kit.servo[PAN_CH].angle  = pan
+        kit.servo[TILT_CH].angle = tilt
+        servo_angles["pan"] = pan; servo_angles["tilt"] = tilt
     last_activity_time = time.time()
 
-def save_calibration():
-    CALIBRATION_FILE.write_text(json.dumps(calibration))
+def servo_pct(angle, center, rang):
+    return round((angle-center)/rang*100.0, 1)
 
-def get_reticle_pos():
-    return calibration_state["reticle_x"], calibration_state["reticle_y"]
+# ─── Zone Runtime State ──────────────────────────────────────────────────────
+zone_vertices = []
+zone_closed   = False
 
-# ─── Home Position Thread ────────────────────────────────────────────────────
+def get_current_zone():
+    if zone_cal["calibration_points"]:
+        interp = interpolate_zone(servo_angles["pan"], servo_angles["tilt"])
+        if interp:
+            return interp, True
+    return zone_vertices, zone_closed
+
+def point_in_zone(cx, cy):
+    verts, closed = get_current_zone()
+    if not closed or len(verts) < 3: return False
+    pts = np.array(verts, dtype=np.int32)
+    return cv2.pointPolygonTest(pts, (float(cx), float(cy)), False) >= 0
+
+# ─── Detection State ─────────────────────────────────────────────────────────
+frame_lock        = threading.Lock()
+latest_frame      = None
+latest_detections = []
+detection_lock    = threading.Lock()
+
+# ─── Tracking & Firing ───────────────────────────────────────────────────────
+tracking = {"primary_target_id":None,"target_entry_times":{},"last_seen":{}}
+firing   = {"active":False,"last_fire_time":0}
+targeting_active = False
+
+# ─── Recording ───────────────────────────────────────────────────────────────
+recording = {"active":False,"writer":None,"last_detection_time":0,"filename":None}
+
+# ─── Threads ─────────────────────────────────────────────────────────────────
+def capture_loop():
+    global latest_frame
+    while True:
+        with mjpeg_lock:
+            fd = mjpeg_buffer
+        if fd:
+            try:
+                arr = np.frombuffer(fd, dtype=np.uint8)
+                f   = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if f is not None:
+                    f = cv2.resize(f, (INFER_W, INFER_H))
+                    with frame_lock:
+                        latest_frame = f.copy()
+            except Exception:
+                pass
+        time.sleep(1/10)
+
+def inference_loop():
+    global latest_detections
+    while True:
+        if not state["armed"]:
+            latest_detections = []; time.sleep(0.1); continue
+        with frame_lock:
+            if latest_frame is None: time.sleep(0.05); continue
+            frame = latest_frame.copy()
+        results = model(frame, verbose=False)
+        sx, sy = FRAME_W/INFER_W, FRAME_H/INFER_H
+        dets = []
+        for r in results[0].boxes:
+            cls = int(r.cls); conf = float(r.conf)
+            if cls == CAT_CLASS and conf >= state["confidence_threshold"]:
+                x1,y1,x2,y2 = map(int, r.xyxy[0])
+                x1,y1,x2,y2 = int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy)
+                cx,cy = (x1+x2)//2,(y1+y2)//2
+                dets.append({"id":f"{cx}_{cy}","x1":x1,"y1":y1,"x2":x2,"y2":y2,
+                             "cx":cx,"cy":cy,"conf":conf,"in_zone":point_in_zone(cx,cy)})
+        with detection_lock:
+            latest_detections = dets
+
+def select_target(detections):
+    in_zone = [d for d in detections if d["in_zone"]]
+    if not in_zone:
+        tracking["primary_target_id"] = None; return None
+    now = time.time()
+    for d in in_zone:
+        if d["id"] not in tracking["target_entry_times"]:
+            tracking["target_entry_times"][d["id"]] = now
+        tracking["last_seen"][d["id"]] = now
+    cur_ids = {d["id"] for d in in_zone}
+    for tid in list(tracking["target_entry_times"]):
+        if tid not in cur_ids:
+            tracking["target_entry_times"].pop(tid,None)
+            tracking["last_seen"].pop(tid,None)
+            if tracking["primary_target_id"] == tid:
+                tracking["primary_target_id"] = None; firing["last_fire_time"] = 0
+    if tracking["primary_target_id"]:
+        for d in in_zone:
+            if d["id"] == tracking["primary_target_id"]: return d
+    def pri(d):
+        return (tracking["target_entry_times"].get(d["id"],now),
+                np.sqrt((d["cx"]-FRAME_W//2)**2+(d["cy"]-FRAME_H//2)**2))
+    t = min(in_zone, key=pri)
+    tracking["primary_target_id"] = t["id"]; firing["last_fire_time"] = 0
+    return t
+
+def servo_tracking_loop():
+    while True:
+        if not state["armed"] or state["setup_phase"] is not None:
+            time.sleep(0.05); continue
+        with detection_lock:
+            dets = list(latest_detections)
+        t = select_target(dets)
+        if t:
+            pan  = servo_angles["pan"]  - ((t["cx"]-FRAME_W/2)/FRAME_W)*66.0
+            tilt = servo_angles["tilt"] - ((t["cy"]-FRAME_H/2)/FRAME_H)*41.0
+            move_servos(pan, tilt)
+        time.sleep(0.05)
+
+def firing_loop():
+    while True:
+        if not state["armed"] or state["setup_phase"] is not None:
+            GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
+            firing["active"] = False; time.sleep(0.1); continue
+        with detection_lock:
+            dets = list(latest_detections)
+        t = select_target(dets); now = time.time()
+        if not t:
+            GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
+            firing["active"] = False; time.sleep(0.1); continue
+        dist = np.sqrt((t["cx"]-FRAME_W//2)**2+(t["cy"]-FRAME_H//2)**2)
+        if dist > state["on_target_tolerance"]:
+            time.sleep(0.05); continue
+        if state["firing_mode"] == "single":
+            if now - firing["last_fire_time"] >= state["reload_time"]:
+                _fire_burst(); firing["last_fire_time"] = time.time()
+        elif state["firing_mode"] == "semi_auto":
+            if now - firing["last_fire_time"] >= state["semi_auto_delay"]:
+                _fire_burst(); firing["last_fire_time"] = time.time()
+        time.sleep(0.05)
+
+def _fire_burst():
+    firing["active"] = True
+    GPIO.output(PUMP_PIN,GPIO.HIGH); GPIO.output(SOLENOID_PIN,GPIO.HIGH)
+    time.sleep(state["burst_length"])
+    GPIO.output(SOLENOID_PIN,GPIO.LOW); GPIO.output(PUMP_PIN,GPIO.LOW)
+    firing["active"] = False
+
+def targeting_loop():
+    while True:
+        if targeting_active:
+            GPIO.output(PUMP_PIN,GPIO.HIGH); time.sleep(0.5)
+            GPIO.output(SOLENOID_PIN,GPIO.HIGH); time.sleep(1.0)
+            GPIO.output(SOLENOID_PIN,GPIO.LOW); time.sleep(1.0)
+            GPIO.output(PUMP_PIN,GPIO.LOW); time.sleep(0.5)
+        else:
+            GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
+            time.sleep(0.1)
+
+def recording_loop():
+    while True:
+        with detection_lock:
+            cats = len(latest_detections) > 0
+        now = time.time()
+        if cats:
+            recording["last_detection_time"] = now
+            if not recording["active"]:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                fn = RECORDINGS_DIR / f"catblastor_{ts}.mp4"
+                recording["filename"] = str(fn)
+                recording["writer"] = cv2.VideoWriter(str(fn),
+                    cv2.VideoWriter_fourcc(*"mp4v"), 15, (FRAME_W,FRAME_H))
+                recording["active"] = True
+        if recording["active"]:
+            with mjpeg_lock:
+                fd = mjpeg_buffer
+            if fd:
+                try:
+                    arr = np.frombuffer(fd, dtype=np.uint8)
+                    f   = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    if f is not None: recording["writer"].write(f)
+                except Exception: pass
+            if not cats and (now-recording["last_detection_time"]) > 10:
+                recording["writer"].release()
+                recording["writer"] = None; recording["active"] = False
+        time.sleep(1/15)
+
 def home_position_loop():
     while True:
         time.sleep(5)
-        if not state["armed"]:
-            continue
+        if not state["armed"] or state["setup_phase"] is not None: continue
         with detection_lock:
             cats = len(latest_detections)
         if cats == 0 and not firing["active"]:
             if time.time() - last_activity_time > HOME_TIMEOUT:
                 move_servos(home_position["pan"], home_position["tilt"])
 
-# ─── Capture Thread — decodes frames from MJPEG buffer for inference ──────────
-def capture_loop():
-    global latest_frame
-    while True:
-        with mjpeg_lock:
-            frame_data = mjpeg_buffer
-        if frame_data:
-            try:
-                arr = np.frombuffer(frame_data, dtype=np.uint8)
-                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                if frame is not None:
-                    frame = cv2.resize(frame, (INFER_W, INFER_H))
-                    with frame_lock:
-                        latest_frame = frame.copy()
-            except Exception:
-                pass
-        time.sleep(1/10)  # 10fps for inference
-
-# ─── Inference Thread ────────────────────────────────────────────────────────
-def inference_loop():
-    global latest_detections
-    while True:
-        if not state["armed"]:
-            latest_detections = []
-            time.sleep(0.1)
-            continue
-        with frame_lock:
-            if latest_frame is None:
-                continue
-            frame = latest_frame.copy()
-        results = model(frame, verbose=False)
-        scale_x = FRAME_W / INFER_W
-        scale_y = FRAME_H / INFER_H
-        detections = []
-        for r in results[0].boxes:
-            cls  = int(r.cls)
-            conf = float(r.conf)
-            if cls == CAT_CLASS and conf >= state["confidence_threshold"]:
-                x1, y1, x2, y2 = map(int, r.xyxy[0])
-                x1 = int(x1 * scale_x); y1 = int(y1 * scale_y)
-                x2 = int(x2 * scale_x); y2 = int(y2 * scale_y)
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                in_zone = (
-                    point_in_angle_zone(cx, cy, state["zone_points"])
-                    if state["zone_closed"] and len(state["zone_points"]) >= 3
-                    else False
-                )
-                detections.append({
-                    "id": f"{cx}_{cy}",
-                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                    "cx": cx, "cy": cy,
-                    "conf": conf,
-                    "in_zone": in_zone,
-                })
-        with detection_lock:
-            latest_detections = detections
-
-# ─── Target Priority ─────────────────────────────────────────────────────────
-def select_target(detections):
-    in_zone = [d for d in detections if d["in_zone"]]
-    if not in_zone:
-        tracking["primary_target_id"] = None
-        tracking["locked"] = False
-        return None
-
-    now = time.time()
-    rx, ry = get_reticle_pos()
-
-    for d in in_zone:
-        if d["id"] not in tracking["target_entry_times"]:
-            tracking["target_entry_times"][d["id"]] = now
-        tracking["last_seen"][d["id"]] = now
-
-    current_ids = {d["id"] for d in in_zone}
-    for tid in list(tracking["target_entry_times"].keys()):
-        if tid not in current_ids:
-            tracking["target_entry_times"].pop(tid, None)
-            tracking["last_seen"].pop(tid, None)
-            if tracking["primary_target_id"] == tid:
-                tracking["primary_target_id"] = None
-                tracking["locked"] = False
-                firing["last_fire_time"] = 0  # immediate fire for new target
-
-    if tracking["primary_target_id"]:
-        for d in in_zone:
-            if d["id"] == tracking["primary_target_id"]:
-                return d
-
-    def priority(d):
-        entry_time = tracking["target_entry_times"].get(d["id"], now)
-        dist = ((d["cx"] - rx) ** 2 + (d["cy"] - ry) ** 2) ** 0.5
-        return (entry_time, dist)
-
-    target = min(in_zone, key=priority)
-    tracking["primary_target_id"] = target["id"]
-    tracking["locked"] = True
-    firing["last_fire_time"] = 0
-    return target
-
-# ─── Servo Tracking Thread ───────────────────────────────────────────────────
-def servo_tracking_loop():
-    while True:
-        if not state["armed"] or state["mode"] == "calibration":
-            time.sleep(0.05)
-            continue
-        with detection_lock:
-            detections = list(latest_detections)
-        target = select_target(detections)
-        if target:
-            aim_x = target["cx"] + calibration["offset_x"]
-            aim_y = target["cy"] + calibration["offset_y"]
-            pan, tilt = pixel_to_angle(aim_x, aim_y)
-            move_servos(pan, tilt)
-        time.sleep(0.05)
-
-# ─── Firing Thread ───────────────────────────────────────────────────────────
-def firing_loop():
-    while True:
-        if not state["armed"] or state["mode"] == "calibration":
-            GPIO.output(PUMP_PIN, GPIO.LOW)
-            GPIO.output(SOLENOID_PIN, GPIO.LOW)
-            firing["active"] = False
-            time.sleep(0.1)
-            continue
-
-        with detection_lock:
-            detections = list(latest_detections)
-
-        target = select_target(detections)
-        now = time.time()
-
-        if not target:
-            GPIO.output(PUMP_PIN, GPIO.LOW)
-            GPIO.output(SOLENOID_PIN, GPIO.LOW)
-            firing["active"] = False
-            time.sleep(0.1)
-            continue
-
-        rx, ry = get_reticle_pos()
-        dist = ((target["cx"] - rx) ** 2 + (target["cy"] - ry) ** 2) ** 0.5
-        on_target = dist <= state["on_target_tolerance"]
-
-        if not on_target:
-            time.sleep(0.05)
-            continue
-
-        if state["firing_mode"] == "single":
-            if now - firing["last_fire_time"] >= state["reload_time"]:
-                _fire_burst()
-                firing["last_fire_time"] = time.time()
-
-        elif state["firing_mode"] == "semi_auto":
-            if now - firing["last_fire_time"] >= state["semi_auto_delay"]:
-                _fire_burst()
-                firing["last_fire_time"] = time.time()
-
-        time.sleep(0.05)
-
-def _fire_burst():
-    firing["active"] = True
-    GPIO.output(PUMP_PIN, GPIO.HIGH)
-    GPIO.output(SOLENOID_PIN, GPIO.HIGH)
-    time.sleep(state["burst_length"])
-    GPIO.output(SOLENOID_PIN, GPIO.LOW)
-    GPIO.output(PUMP_PIN, GPIO.LOW)
-    firing["active"] = False
-
-# ─── Calibration Firing Thread ───────────────────────────────────────────────
-def calibration_loop():
-    while True:
-        if calibration_state["active"]:
-            # Pump runs, solenoid pulses for stream calibration
-            GPIO.output(PUMP_PIN, GPIO.HIGH)
-            time.sleep(0.5)  # let pump prime
-            GPIO.output(SOLENOID_PIN, GPIO.HIGH)
-            time.sleep(1.0)
-            GPIO.output(SOLENOID_PIN, GPIO.LOW)
-            time.sleep(1.0)
-            GPIO.output(PUMP_PIN, GPIO.LOW)
-            time.sleep(0.5)
-        else:
-            GPIO.output(PUMP_PIN, GPIO.LOW)
-            GPIO.output(SOLENOID_PIN, GPIO.LOW)
-            time.sleep(0.1)
-
-# ─── Recording Thread ────────────────────────────────────────────────────────
-def recording_loop():
-    global latest_frame
-    while True:
-        with detection_lock:
-            cats_detected = len(latest_detections) > 0
-
-        now = time.time()
-
-        if cats_detected:
-            recording["last_detection_time"] = now
-            if not recording["active"]:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = RECORDINGS_DIR / f"catblastor_{timestamp}.mp4"
-                recording["filename"] = str(filename)
-                recording["writer"] = cv2.VideoWriter(
-                    str(filename),
-                    cv2.VideoWriter_fourcc(*"mp4v"),
-                    15, (FRAME_W, FRAME_H)
-                )
-                recording["active"] = True
-
-        if recording["active"]:
-            with frame_lock:
-                frame = latest_frame.copy() if latest_frame is not None else None
-            if frame is not None:
-                recording["writer"].write(frame)
-            if not cats_detected and (now - recording["last_detection_time"]) > 10:
-                recording["writer"].release()
-                recording["writer"] = None
-                recording["active"] = False
-                recording["filename"] = None
-
-        time.sleep(1/15)
-
 # ─── Start Threads ───────────────────────────────────────────────────────────
+threading.Thread(target=start_streaming,     daemon=True).start()
+threading.Thread(target=mjpeg_reader_loop,   daemon=True).start()
 threading.Thread(target=capture_loop,        daemon=True).start()
 threading.Thread(target=inference_loop,      daemon=True).start()
 threading.Thread(target=servo_tracking_loop, daemon=True).start()
 threading.Thread(target=firing_loop,         daemon=True).start()
-threading.Thread(target=calibration_loop,    daemon=True).start()
+threading.Thread(target=targeting_loop,      daemon=True).start()
 threading.Thread(target=recording_loop,      daemon=True).start()
 threading.Thread(target=home_position_loop,  daemon=True).start()
-threading.Thread(target=start_streaming,     daemon=True).start()
-threading.Thread(target=mjpeg_reader_loop,   daemon=True).start()
 
 # ─── FastAPI ─────────────────────────────────────────────────────────────────
 app = FastAPI()
@@ -482,708 +438,810 @@ def stream():
             with mjpeg_lock:
                 frame = mjpeg_buffer
             if frame:
-                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" +
-                       frame + b"\r\n")
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
             time.sleep(1/30)
-    return StreamingResponse(generate(),
-        media_type="multipart/x-mixed-replace; boundary=frame")
+    return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 @app.get("/arm")
 def arm():
-    state["armed"] = True
-    return {"status": "armed"}
+    state["armed"] = True; return {"status":"armed"}
 
 @app.get("/disarm")
 def disarm():
-    state["armed"] = False
-    calibration_state["active"] = False
-    GPIO.output(PUMP_PIN, GPIO.LOW)
-    GPIO.output(SOLENOID_PIN, GPIO.LOW)
-    return {"status": "disarmed"}
+    global targeting_active
+    state["armed"] = False; targeting_active = False
+    GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
+    return {"status":"disarmed"}
 
 @app.get("/status")
 def status():
     with detection_lock:
         cats = len(latest_detections)
-        in_zone_count = len([d for d in latest_detections if d["in_zone"]])
-        dets = [
-            {
-                "x1": d["x1"], "y1": d["y1"], "x2": d["x2"], "y2": d["y2"],
-                "conf": round(d["conf"], 2),
-                "in_zone": d["in_zone"],
-                "is_primary": d["id"] == tracking["primary_target_id"]
-            }
-            for d in latest_detections
-        ]
-    # Convert zone angle points to pixel coords for overlay rendering
-    zone_px = [world_angle_to_pixel(p[0], p[1]) for p in state["zone_points"]] if state["zone_points"] else []
+        in_z = len([d for d in latest_detections if d["in_zone"]])
+        dets = [{"x1":d["x1"],"y1":d["y1"],"x2":d["x2"],"y2":d["y2"],
+                 "conf":round(d["conf"],2),"in_zone":d["in_zone"],
+                 "is_primary":d["id"]==tracking["primary_target_id"]}
+                for d in latest_detections]
+    zone_px, z_closed = get_current_zone()
     return {
-        "armed": state["armed"],
-        "mode": state["mode"],
-        "cats_detected": cats,
-        "cats_in_zone": in_zone_count,
-        "firing": firing["active"],
-        "recording": recording["active"],
-        "calibration_active": calibration_state["active"],
-        "reticle_x": calibration_state["reticle_x"],
-        "reticle_y": calibration_state["reticle_y"],
-        "pan": servo_angles["pan"],
-        "tilt": servo_angles["tilt"],
-        "fov_h": fov["h"],
-        "fov_v": fov["v"],
-        "detections": dets,
-        "zone_px": zone_px,
-        "zone_closed": state["zone_closed"],
+        "armed":state["armed"],"setup_phase":state["setup_phase"],
+        "cats_detected":cats,"cats_in_zone":in_z,
+        "firing":firing["active"],"recording":recording["active"],
+        "targeting_active":targeting_active,
+        "pan":round(servo_angles["pan"],1),"tilt":round(servo_angles["tilt"],1),
+        "pan_pct":servo_pct(servo_angles["pan"],PAN_CENTER,PAN_RANGE),
+        "tilt_pct":servo_pct(servo_angles["tilt"],TILT_CENTER,TILT_RANGE),
+        "detections":dets,"zone_px":zone_px,"zone_closed":z_closed,
+        "n_cal_points":len(zone_cal["calibration_points"]),
+        "strength":compute_calibration_strength(),
+        "cam":cam_settings,"depth_m":zone_cal["depth_m"],
     }
 
 @app.post("/settings")
 async def update_settings(request: Request):
     data = await request.json()
-    for key in ["firing_mode", "burst_length", "reload_time",
-                "semi_auto_delay", "confidence_threshold", "on_target_tolerance"]:
-        if key in data:
-            state[key] = data[key]
-    return {"status": "updated"}
+    for k in ["firing_mode","burst_length","reload_time","semi_auto_delay",
+               "confidence_threshold","on_target_tolerance"]:
+        if k in data: state[k] = data[k]
+    save_settings(); return {"status":"updated"}
 
-@app.post("/zone")
-async def set_zone(request: Request):
+@app.post("/camera")
+async def update_camera(request: Request):
     data = await request.json()
-    raw_points = data.get("points", [])
-    # Convert pixel coordinates to world angle space using current servo position
-    angle_points = []
-    for p in raw_points:
-        pan, tilt = pixel_to_world_angle(p[0], p[1])
-        angle_points.append([pan, tilt])
-    state["zone_points"] = angle_points
-    state["zone_closed"] = data.get("closed", False)
-    return {"status": "zone updated"}
+    for k in ["brightness","contrast","saturation","sharpness","ev"]:
+        if k in data: cam_settings[k] = float(data[k])
+    save_cam_settings()
+    threading.Thread(target=restart_rpicam, daemon=True).start()
+    return cam_settings
 
-@app.post("/zone/drag")
-async def drag_zone(request: Request):
+@app.post("/servos/move")
+async def move_servos_ep(request: Request):
     data = await request.json()
-    dx = data.get("dx", 0)
-    dy = data.get("dy", 0)
-    pan_delta  = data.get("pan_delta",  0)
-    tilt_delta = data.get("tilt_delta", 0)
-
-    print(f"Zone drag: dx={dx} dy={dy} pan_delta={pan_delta:.2f} tilt_delta={tilt_delta:.2f} fov={fov}")
-
-    if len(state["zone_points"]) < 3 or not state["zone_closed"]:
-        return {"status": "no closed zone"}
-
-    if abs(pan_delta) > 0.5 and abs(dx) > 2:
-        new_h = abs(pan_delta) / (abs(dx) / FRAME_W)
-        fov["h"] = round(clamp(new_h, 20.0, 120.0), 2)
-        print(f"Updated H_FOV to {fov['h']}")
-
-    if abs(tilt_delta) > 0.5 and abs(dy) > 2:
-        new_v = abs(tilt_delta) / (abs(dy) / FRAME_H)
-        fov["v"] = round(clamp(new_v, 10.0, 80.0), 2)
-        print(f"Updated V_FOV to {fov['v']}")
-
-    save_fov()
-
-    pan_shift  = (dx / FRAME_W) * fov["h"]
-    tilt_shift = (dy / FRAME_H) * fov["v"]
-    state["zone_points"] = [
-        [p[0] - pan_shift, p[1] - tilt_shift]
-        for p in state["zone_points"]
-    ]
-
-    return {"status": "zone dragged", "fov_h": fov["h"], "fov_v": fov["v"]}
-
-@app.get("/fov")
-def get_fov():
-    return {"h": fov["h"], "v": fov["v"]}
-
-@app.post("/fov")
-async def set_fov(request: Request):
-    data = await request.json()
-    if "h" in data:
-        fov["h"] = round(clamp(float(data["h"]), 20.0, 120.0), 2)
-    if "v" in data:
-        fov["v"] = round(clamp(float(data["v"]), 10.0, 80.0), 2)
-    save_fov()
-    return {"h": fov["h"], "v": fov["v"]}
-
-@app.get("/zone/clear")
-def clear_zone():
-    state["zone_points"] = []
-    state["zone_closed"] = False
-    return {"status": "cleared"}
-
-@app.post("/calibration/reticle")
-async def set_reticle(request: Request):
-    data = await request.json()
-    calibration_state["reticle_x"] = data.get("x", FRAME_W // 2)
-    calibration_state["reticle_y"] = data.get("y", FRAME_H // 2)
-    calibration["offset_x"] = calibration_state["reticle_x"] - FRAME_W // 2
-    calibration["offset_y"] = calibration_state["reticle_y"] - FRAME_H // 2
-    save_calibration()
-    return {"status": "reticle updated"}
-
-@app.get("/calibration/start")
-def calibration_start():
-    state["mode"] = "calibration"
-    calibration_state["active"] = True
-    return {"status": "calibration started"}
-
-@app.get("/calibration/stop")
-def calibration_stop():
-    state["mode"] = "live"
-    calibration_state["active"] = False
-    GPIO.output(PUMP_PIN, GPIO.LOW)
-    GPIO.output(SOLENOID_PIN, GPIO.LOW)
-    return {"status": "calibration stopped"}
-
-@app.get("/mode/{mode}")
-def set_mode(mode: str):
-    if mode in ["live", "zone_draw", "calibration"]:
-        state["mode"] = mode
-        if mode != "calibration":
-            calibration_state["active"] = False
-    return {"mode": state["mode"]}
+    pan  = clamp(servo_angles["pan"]  - data.get("pan_delta",0),  PAN_MIN,  PAN_MAX)
+    tilt = clamp(servo_angles["tilt"] + data.get("tilt_delta",0), TILT_MIN, TILT_MAX)
+    move_servos(pan, tilt); return {"pan":pan,"tilt":tilt}
 
 @app.get("/servos/center")
 def center_servos():
-    move_servos(90, 90)
-    return {"status": "centered"}
-
-@app.post("/servos/move")
-async def move_servos_endpoint(request: Request):
-    data = await request.json()
-    pan  = clamp(servo_angles["pan"]  - data.get("pan_delta",  0), 45, 135)  # inverted
-    tilt = clamp(servo_angles["tilt"] + data.get("tilt_delta", 0), 45, 135)
-    move_servos(pan, tilt)
-    return {"pan": pan, "tilt": tilt}
+    move_servos(PAN_CENTER,TILT_CENTER); return {"status":"centered"}
 
 @app.get("/servos/home/set")
 def set_home():
     home_position["pan"]  = servo_angles["pan"]
     home_position["tilt"] = servo_angles["tilt"]
-    save_home_position()
-    return {"home_pan": home_position["pan"], "home_tilt": home_position["tilt"]}
+    save_home_position(); return home_position
 
 @app.get("/servos/home/go")
 def go_home():
-    move_servos(home_position["pan"], home_position["tilt"])
-    return {"status": "going home"}
+    move_servos(home_position["pan"],home_position["tilt"]); return {"status":"going home"}
+
+# ─── Setup Endpoints ──────────────────────────────────────────────────────────
+@app.get("/setup/start")
+def setup_start():
+    state["setup_phase"] = "home"; return {"phase":"home"}
+
+@app.get("/setup/set_home")
+def setup_set_home():
+    zone_cal["home_pan"]  = servo_angles["pan"]
+    zone_cal["home_tilt"] = servo_angles["tilt"]
+    home_position["pan"]  = servo_angles["pan"]
+    home_position["tilt"] = servo_angles["tilt"]
+    save_home_position(); state["setup_phase"] = "draw"
+    return {"phase":"draw"}
+
+@app.post("/setup/zone")
+async def setup_zone(request: Request):
+    global zone_vertices, zone_closed
+    data = await request.json()
+    zone_vertices = data.get("vertices",[])
+    zone_closed   = data.get("closed",False)
+    return {"status":"ok","n_verts":len(zone_vertices)}
+
+@app.get("/setup/begin_forced_cal")
+def begin_forced_cal():
+    if zone_closed and len(zone_vertices) >= 3:
+        zone_cal["calibration_points"] = [{
+            "pan":zone_cal["home_pan"],"tilt":zone_cal["home_tilt"],
+            "vertices":[list(v) for v in zone_vertices]}]
+        save_zone_cal()
+    state["setup_phase"] = "forced_L"
+    def go():
+        time.sleep(0.5)
+        move_servos(PAN_MIN, zone_cal["home_tilt"], slow=True)
+    threading.Thread(target=go, daemon=True).start()
+    return {"phase":"forced_L"}
+
+@app.post("/setup/save_forced_point")
+async def save_forced_point(request: Request):
+    data     = await request.json()
+    vertices = data.get("vertices", zone_vertices)
+    phase    = state["setup_phase"]
+    existing = next((p for p in zone_cal["calibration_points"]
+                     if abs(p["pan"]-servo_angles["pan"])<0.5 and
+                        abs(p["tilt"]-servo_angles["tilt"])<0.5), None)
+    point = {"pan":servo_angles["pan"],"tilt":servo_angles["tilt"],
+             "vertices":[list(v) for v in vertices]}
+    if existing: zone_cal["calibration_points"].remove(existing)
+    zone_cal["calibration_points"].append(point)
+    save_zone_cal()
+    next_map = {"forced_L":"forced_R","forced_R":"forced_up",
+                "forced_up":"forced_down","forced_down":"extra"}
+    next_phase = next_map.get(phase,"extra")
+    state["setup_phase"] = next_phase
+    def go():
+        time.sleep(0.3)
+        if phase == "forced_L":   move_servos(PAN_MAX,             zone_cal["home_tilt"], slow=True)
+        elif phase == "forced_R": move_servos(zone_cal["home_pan"], TILT_MIN,              slow=True)
+        elif phase == "forced_up":move_servos(zone_cal["home_pan"], TILT_MAX,              slow=True)
+        elif phase == "forced_down": move_servos(zone_cal["home_pan"], zone_cal["home_tilt"], slow=True)
+    threading.Thread(target=go, daemon=True).start()
+    return {"phase":next_phase}
+
+@app.post("/setup/add_extra_point")
+async def add_extra_point(request: Request):
+    data     = await request.json()
+    vertices = data.get("vertices", zone_vertices)
+    existing = next((p for p in zone_cal["calibration_points"]
+                     if abs(p["pan"]-servo_angles["pan"])<0.5 and
+                        abs(p["tilt"]-servo_angles["tilt"])<0.5), None)
+    point = {"pan":servo_angles["pan"],"tilt":servo_angles["tilt"],
+             "vertices":[list(v) for v in vertices]}
+    if existing: zone_cal["calibration_points"].remove(existing)
+    zone_cal["calibration_points"].append(point)
+    save_zone_cal()
+    return {"n_points":len(zone_cal["calibration_points"]),
+            "strength":compute_calibration_strength()}
+
+@app.post("/setup/remove_point")
+async def remove_point(request: Request):
+    data = await request.json()
+    idx  = data.get("index",-1)
+    if 0 <= idx < len(zone_cal["calibration_points"]):
+        zone_cal["calibration_points"].pop(idx)
+        save_zone_cal()
+    return {"n_points":len(zone_cal["calibration_points"]),
+            "strength":compute_calibration_strength()}
+
+@app.post("/setup/goto_point")
+async def goto_point(request: Request):
+    data = await request.json(); idx = data.get("index",0)
+    if 0 <= idx < len(zone_cal["calibration_points"]):
+        p = zone_cal["calibration_points"][idx]
+        move_servos(p["pan"], p["tilt"], slow=True)
+    return {"status":"ok"}
+
+@app.get("/setup/cal_points")
+def get_cal_points():
+    return {"points":[{"index":i,"pan":round(p["pan"],1),"tilt":round(p["tilt"],1)}
+                      for i,p in enumerate(zone_cal["calibration_points"])]}
+
+@app.post("/setup/depth")
+async def set_depth(request: Request):
+    data = await request.json()
+    zone_cal["depth_m"] = data.get("depth_m",None)
+    save_zone_cal(); return {"depth_m":zone_cal["depth_m"]}
+
+@app.get("/setup/finish")
+def setup_finish():
+    state["setup_phase"] = None; return {"status":"complete"}
+
+@app.get("/setup/reset")
+def setup_reset():
+    global zone_vertices, zone_closed
+    zone_cal["calibration_points"] = []
+    zone_cal["home_pan"]  = 90.0; zone_cal["home_tilt"] = 90.0
+    zone_cal["depth_m"]   = None
+    zone_vertices = []; zone_closed = False
+    save_zone_cal(); state["setup_phase"] = "home"
+    move_servos(PAN_CENTER, TILT_CENTER)
+    return {"status":"reset","phase":"home"}
+
+@app.get("/setup/targeting/start")
+def targeting_start():
+    global targeting_active
+    targeting_active = True; return {"targeting":True}
+
+@app.get("/setup/targeting/stop")
+def targeting_stop():
+    global targeting_active
+    targeting_active = False
+    GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
+    return {"targeting":False}
 
 @app.get("/recordings")
 def list_recordings():
     files = sorted(RECORDINGS_DIR.glob("*.mp4"), reverse=True)
-    return {"recordings": [f.name for f in files]}
+    return {"recordings":[f.name for f in files]}
 
 @app.get("/recordings/{filename}")
 def get_recording(filename: str):
     path = RECORDINGS_DIR / filename
-    if path.exists():
-        return FileResponse(str(path), media_type="video/mp4")
-    return {"error": "not found"}
+    if path.exists(): return FileResponse(str(path), media_type="video/mp4")
+    return {"error":"not found"}
 
 @app.get("/", response_class=HTMLResponse)
-def index():
-    return HTML
+def index(): return HTML
 
 # ─── Frontend ────────────────────────────────────────────────────────────────
-HTML = """
-<!DOCTYPE html>
+HTML = """<!DOCTYPE html>
 <html>
 <head>
 <title>CatBlastor</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: #111; color: #eee; font-family: sans-serif; }
-  header { background: #1a1a1a; padding: 10px 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #333; }
-  h1 { color: #ff4444; font-size: 1.4em; }
-  nav button { background: none; border: none; color: #aaa; font-size: 1em; padding: 8px 16px; cursor: pointer; border-bottom: 2px solid transparent; }
-  nav button.active { color: #fff; border-bottom: 2px solid #ff4444; }
-  .page { display: none; padding: 16px; }
-  .page.active { display: block; }
-  #video-container { position: relative; display: inline-block; }
-  #overlay { position: absolute; top: 0; left: 0; cursor: crosshair; }
-  .controls { margin: 12px 0; display: flex; flex-wrap: wrap; gap: 8px; }
-  button.btn { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9em; }
-  .btn-green { background: #2d7a2d; color: white; }
-  .btn-red { background: #7a2d2d; color: white; }
-  .btn-blue { background: #2d4a7a; color: white; }
-  .btn-gray { background: #444; color: white; }
-  .btn-yellow { background: #7a6a2d; color: white; }
-  .btn.active-mode { outline: 2px solid #ff4444; }
-  #status-bar { background: #1a1a1a; border-radius: 4px; padding: 8px 12px; margin: 8px 0; font-size: 0.85em; display: flex; gap: 16px; flex-wrap: wrap; }
-  .status-item { display: flex; align-items: center; gap: 6px; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: #555; }
-  .dot.on { background: #44ff44; }
-  .dot.warn { background: #ff4444; }
-  .dot.rec { background: #ff4444; animation: blink 1s infinite; }
-  @keyframes blink { 50% { opacity: 0; } }
-  .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; max-width: 600px; }
-  .setting { display: flex; flex-direction: column; gap: 4px; }
-  label { font-size: 0.85em; color: #aaa; }
-  input[type=range] { width: 100%; }
-  select { background: #222; color: #eee; border: 1px solid #444; padding: 4px 8px; border-radius: 4px; }
-  .recordings-list { display: flex; flex-direction: column; gap: 8px; max-width: 600px; }
-  .recording-item { background: #1a1a1a; border-radius: 4px; padding: 10px; display: flex; justify-content: space-between; align-items: center; }
-  .value-label { color: #fff; font-size: 0.9em; }
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:#111;color:#eee;font-family:sans-serif;}
+header{background:#1a1a1a;padding:10px 20px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #333;}
+h1{color:#ff4444;font-size:1.4em;}
+nav button{background:none;border:none;color:#aaa;font-size:1em;padding:8px 16px;cursor:pointer;border-bottom:2px solid transparent;}
+nav button.active{color:#fff;border-bottom:2px solid #ff4444;}
+.page{display:none;padding:16px;}.page.active{display:block;}
+.vw{position:relative;display:inline-block;}
+.vw canvas{position:absolute;top:0;left:0;}
+.ctrl{margin:8px 0;display:flex;flex-wrap:wrap;gap:8px;align-items:center;}
+button.btn{padding:7px 14px;border:none;border-radius:4px;cursor:pointer;font-size:0.88em;}
+.g{background:#2d7a2d;color:#fff;}.r{background:#7a2d2d;color:#fff;}
+.b{background:#2d4a7a;color:#fff;}.y{background:#7a6a2d;color:#fff;}
+.gr{background:#444;color:#fff;}.btn.on{outline:2px solid #ff4444;}
+#sb{background:#1a1a1a;border-radius:4px;padding:8px 12px;margin:8px 0;font-size:0.85em;display:flex;gap:16px;flex-wrap:wrap;}
+.si{display:flex;align-items:center;gap:6px;}
+.dot{width:8px;height:8px;border-radius:50%;background:#555;}
+.dot.on{background:#44ff44;}.dot.warn{background:#ff4444;}
+.dot.rec{background:#ff4444;animation:blink 1s infinite;}
+@keyframes blink{50%{opacity:0;}}
+.sbar-wrap{display:flex;align-items:center;gap:6px;font-size:0.82em;}
+.sbar{width:110px;height:10px;background:#333;border-radius:5px;position:relative;}
+.sind{position:absolute;width:4px;height:10px;background:#4af;border-radius:2px;transform:translateX(-50%);}
+.sg{display:grid;grid-template-columns:1fr 1fr;gap:14px;max-width:600px;}
+.set{display:flex;flex-direction:column;gap:4px;}
+label{font-size:0.85em;color:#aaa;}
+input[type=range]{width:100%;}
+input[type=number]{width:64px;background:#222;color:#eee;border:1px solid #444;padding:2px 4px;border-radius:3px;}
+select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-radius:4px;}
+.vl{color:#fff;font-size:0.9em;}
+.rl{display:flex;flex-direction:column;gap:8px;max-width:600px;}
+.ri{background:#1a1a1a;border-radius:4px;padding:10px;display:flex;justify-content:space-between;align-items:center;}
+.ph{background:#1a1a2a;border:1px solid #334;border-radius:6px;padding:12px;margin:8px 0;max-width:660px;}
+.ph h3{color:#aaf;margin-bottom:6px;font-size:1em;}
+.ph p{color:#aaa;font-size:0.85em;margin-bottom:8px;}
+.sbar2{height:16px;background:#333;border-radius:8px;overflow:hidden;margin:4px 0;}
+.sf{height:100%;background:linear-gradient(to right,#f44,#fa0,#4f4);border-radius:8px;transition:width .5s;}
+.cpl{background:#1a1a1a;border-radius:4px;padding:7px 12px;display:flex;justify-content:space-between;align-items:center;margin:3px 0;cursor:pointer;}
+.cpl:hover{background:#252525;}
 </style>
 </head>
 <body>
 <header>
   <h1>🐱 CatBlastor</h1>
   <nav>
-    <button class="active" onclick="showPage('live', this)">Live</button>
-    <button onclick="showPage('calibration', this)">Calibrate</button>
-    <button onclick="showPage('settings', this)">Settings</button>
-    <button onclick="showPage('recordings', this)">Recordings</button>
+    <button class="active" onclick="showPage('live',this)">Live</button>
+    <button onclick="showPage('setup',this)">Setup</button>
+    <button onclick="showPage('settings',this)">Settings</button>
+    <button onclick="showPage('recordings',this)">Recordings</button>
   </nav>
 </header>
 
-<!-- LIVE PAGE -->
+<!-- LIVE -->
 <div id="live" class="page active">
-  <div id="status-bar">
-    <div class="status-item"><div class="dot" id="dot-armed"></div><span id="txt-armed">Disarmed</span></div>
-    <div class="status-item"><div class="dot" id="dot-cats"></div><span id="txt-cats">No cats</span></div>
-    <div class="status-item"><div class="dot" id="dot-zone"></div><span id="txt-zone">Zone clear</span></div>
-    <div class="status-item"><div class="dot" id="dot-firing"></div><span id="txt-firing">Idle</span></div>
-    <div class="status-item"><div class="dot" id="dot-rec"></div><span id="txt-rec">Not recording</span></div>
+  <div id="sb">
+    <div class="si"><div class="dot" id="da"></div><span id="ta">Disarmed</span></div>
+    <div class="si"><div class="dot" id="dc"></div><span id="tc">No cats</span></div>
+    <div class="si"><div class="dot" id="dz"></div><span id="tz">Zone clear</span></div>
+    <div class="si"><div class="dot" id="df"></div><span id="tf">Idle</span></div>
+    <div class="si"><div class="dot" id="dr"></div><span id="tr">Not recording</span></div>
   </div>
-
-  <div id="video-container">
-    <div style="position:relative;display:inline-block">
-      <img src="/stream" width="640" height="480" style="display:block;background:#000"/>
-      <canvas id="overlay" width="640" height="480" style="position:absolute;top:0;left:0;cursor:crosshair"></canvas>
-    </div>
+  <div class="vw">
+    <img src="/stream" width="640" height="480" style="display:block;background:#000">
+    <canvas id="ov-live" width="640" height="480" style="cursor:default"></canvas>
   </div>
-
-  <div class="controls">
-    <button class="btn btn-green" onclick="fetch('/arm')">ARM</button>
-    <button class="btn btn-red" onclick="fetch('/disarm')">DISARM</button>
-    <button class="btn btn-blue" id="btn-zone" onclick="toggleMode('zone_draw')">Draw Zone</button>
-    <button class="btn btn-gray" onclick="clearZoneLocal()">Clear Zone</button>
-    <button class="btn btn-blue" id="btn-close-zone" onclick="closeZone()" style="display:none">Close Zone</button>
-    <button class="btn btn-gray" onclick="fetch('/servos/center')">Center Servos</button>
+  <div class="ctrl">
+    <button class="btn g" onclick="fetch('/arm')">ARM</button>
+    <button class="btn r" onclick="fetch('/disarm')">DISARM</button>
+    <button class="btn gr" onclick="fetch('/servos/center')">Center</button>
+    <button class="btn gr" onclick="fetch('/servos/home/go')">🏠 Home</button>
+    <button class="btn gr" onclick="fetch('/servos/home/set')">📌 Set Home</button>
   </div>
-
-  <div class="controls" style="align-items:center">
+  <div class="ctrl">
     <span style="color:#aaa;font-size:0.85em">Pan/Tilt:</span>
-    <button class="btn btn-gray" onclick="moveServo(0,-5)">▲ Tilt Up</button>
-    <button class="btn btn-gray" onclick="moveServo(0, 5)">▼ Tilt Down</button>
-    <button class="btn btn-gray" onclick="moveServo(-5,0)">◀ Pan Left</button>
-    <button class="btn btn-gray" onclick="moveServo( 5,0)">▶ Pan Right</button>
-    <button class="btn btn-gray" onclick="fetch('/servos/home/go')">🏠 Go Home</button>
-    <button class="btn btn-yellow" onclick="fetch('/servos/home/set')">📌 Set Home</button>
+    <button class="btn gr" onclick="mv(0,-5)">▲</button>
+    <button class="btn gr" onclick="mv(0,5)">▼</button>
+    <button class="btn gr" onclick="mv(-5,0)">◀</button>
+    <button class="btn gr" onclick="mv(5,0)">▶</button>
+  </div>
+  <div class="ctrl" style="gap:20px">
+    <div class="sbar-wrap">Pan:<span id="pp">0%</span><div class="sbar"><div class="sind" id="pi" style="left:50%"></div></div></div>
+    <div class="sbar-wrap">Tilt:<span id="tp">0%</span><div class="sbar"><div class="sind" id="ti" style="left:50%"></div></div></div>
   </div>
 </div>
 
-<!-- CALIBRATION PAGE -->
-<div id="calibration" class="page">
-  <div id="video-container-cal">
-    <div style="position:relative;display:inline-block">
-      <img src="/stream" width="640" height="480" style="display:block;background:#000"/>
-      <canvas id="overlay-cal" width="640" height="480" style="position:absolute;top:0;left:0;cursor:crosshair"></canvas>
-    </div>
+<!-- SETUP -->
+<div id="setup" class="page">
+  <div class="vw">
+    <img src="/stream" width="640" height="480" style="display:block;background:#000">
+    <canvas id="ov-setup" width="640" height="480" style="cursor:crosshair"></canvas>
   </div>
-
-  <div class="controls">
-    <button class="btn btn-blue" id="btn-zone-cal" onclick="toggleMode('zone_draw')">Draw Zone</button>
-    <button class="btn btn-gray" onclick="clearZoneLocal()">Clear Zone</button>
-    <button class="btn btn-blue" id="btn-close-zone-cal" onclick="closeZone()" style="display:none">Close Zone</button>
-    <button class="btn btn-yellow" id="btn-targeting" onclick="toggleTargeting()">▶ Start Targeting</button>
+  <div class="ctrl" style="gap:20px;margin-top:6px">
+    <div class="sbar-wrap">Pan:<span id="pp-s">0%</span><div class="sbar"><div class="sind" id="pi-s" style="left:50%"></div></div></div>
+    <div class="sbar-wrap">Tilt:<span id="tp-s">0%</span><div class="sbar"><div class="sind" id="ti-s" style="left:50%"></div></div></div>
   </div>
-
-  <div class="controls" style="align-items:center">
+  <div class="ctrl">
     <span style="color:#aaa;font-size:0.85em">Pan/Tilt:</span>
-    <button class="btn btn-gray" onclick="moveServo(0,-5)">▲ Tilt Up</button>
-    <button class="btn btn-gray" onclick="moveServo(0, 5)">▼ Tilt Down</button>
-    <button class="btn btn-gray" onclick="moveServo(-5,0)">◀ Pan Left</button>
-    <button class="btn btn-gray" onclick="moveServo( 5,0)">▶ Pan Right</button>
-    <button class="btn btn-gray" onclick="fetch('/servos/home/go')">🏠 Go Home</button>
-    <button class="btn btn-yellow" onclick="fetch('/servos/home/set')">📌 Set Home</button>
+    <button class="btn gr" onclick="mv(0,-5)">▲</button>
+    <button class="btn gr" onclick="mv(0,5)">▼</button>
+    <button class="btn gr" onclick="mv(-5,0)">◀</button>
+    <button class="btn gr" onclick="mv(5,0)">▶</button>
+    <button class="btn gr" onclick="fetch('/servos/home/go')">🏠 Go Home</button>
   </div>
 
-  <div style="margin-top:12px;padding:12px;background:#1a1a1a;border-radius:4px;max-width:640px">
-    <strong style="color:#fff">FOV Calibration</strong>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px">
-      <div>
-        <label style="color:#aaa;font-size:0.85em">H-FOV (°): <span id="val-hfov" style="color:#fff">66.0</span></label><br>
-        <button class="btn btn-gray" style="padding:4px 10px" onclick="adjustFov('h',-1)">−</button>
-        <button class="btn btn-gray" style="padding:4px 10px" onclick="adjustFov('h',-0.1)">−0.1</button>
-        <button class="btn btn-gray" style="padding:4px 10px" onclick="adjustFov('h',0.1)">+0.1</button>
-        <button class="btn btn-gray" style="padding:4px 10px" onclick="adjustFov('h',1)">+</button>
-      </div>
-      <div>
-        <label style="color:#aaa;font-size:0.85em">V-FOV (°): <span id="val-vfov" style="color:#fff">41.0</span></label><br>
-        <button class="btn btn-gray" style="padding:4px 10px" onclick="adjustFov('v',-1)">−</button>
-        <button class="btn btn-gray" style="padding:4px 10px" onclick="adjustFov('v',-0.1)">−0.1</button>
-        <button class="btn btn-gray" style="padding:4px 10px" onclick="adjustFov('v',0.1)">+0.1</button>
-        <button class="btn btn-gray" style="padding:4px 10px" onclick="adjustFov('v',1)">+</button>
-      </div>
+  <div id="ph-home" class="ph" style="display:none">
+    <h3>Step 1 of 6 — Set Home Position</h3>
+    <p>Pan/tilt until camera points where you want it to rest. This is the zone drawing reference position.</p>
+    <button class="btn g" onclick="setupSetHome()">✓ Set Home &amp; Draw Zone</button>
+    <button class="btn gr" style="margin-left:8px" onclick="setupReset()">Start Over</button>
+  </div>
+
+  <div id="ph-draw" class="ph" style="display:none">
+    <h3>Step 2 of 6 — Draw Forbidden Zone</h3>
+    <p>Click to place vertices. Use mode buttons to add, move or delete vertices.</p>
+    <div class="ctrl">
+      <button class="btn b on" id="btn-add" onclick="vmode('add')">+ Add</button>
+      <button class="btn b" id="btn-mv" onclick="vmode('move')">↔ Move</button>
+      <button class="btn r" id="btn-del" onclick="vmode('delete')">✕ Delete</button>
+      <button class="btn gr" onclick="clearZone()">Clear All</button>
+      <button class="btn y" id="btn-cz" onclick="closeZone()" disabled>Close Zone</button>
     </div>
-    <div style="color:#aaa;font-size:0.75em;margin-top:8px">
-      Drag the closed zone to correct its position — adjusts ratio automatically.<br>
-      Or use +/− buttons to tune manually.
+    <div class="ctrl" style="margin-top:4px">
+      <button class="btn g" id="btn-dd" onclick="beginForcedCal()" disabled>✓ Done — Begin Calibration</button>
+      <button class="btn gr" onclick="setupReset()">Start Over</button>
+    </div>
+  </div>
+
+  <div id="ph-forced" class="ph" style="display:none">
+    <h3 id="ftitle">Forced Calibration</h3>
+    <p id="fmsg"></p>
+    <div class="ctrl">
+      <button class="btn b" onclick="vmode('move')">↔ Move Vertices</button>
+      <button class="btn y" id="btn-tgt" onclick="toggleTgt()">▶ Targeting</button>
+    </div>
+    <div style="margin:8px 0;font-size:0.85em">
+      Depth to zone center (m, optional):
+      <input type="number" id="depth-in" step="0.1" min="0.1" style="width:70px"
+             onchange="setDepth(this.value)">
+    </div>
+    <button class="btn g" id="btn-df" onclick="saveForcedPt()">✓ Done</button>
+    <button class="btn gr" style="margin-left:8px" onclick="setupReset()">Start Over</button>
+  </div>
+
+  <div id="ph-extra" class="ph" style="display:none">
+    <h3>Step 6 — Additional Calibration Points</h3>
+    <p>Pan/tilt to new positions and save points. Add at least 4 more for full strength.</p>
+    <div class="ctrl">
+      <button class="btn b" onclick="vmode('move')">↔ Move Vertices</button>
+      <button class="btn y" id="btn-tgt-e" onclick="toggleTgt()">▶ Targeting</button>
+      <button class="btn g" onclick="addExtraPt()">📍 Save Point Here</button>
+    </div>
+    <div style="margin:8px 0">
+      <strong style="font-size:0.9em">Calibration Strength</strong>
+      <div class="sbar2"><div class="sf" id="sfill" style="width:0%"></div></div>
+      <div style="font-size:0.8em;color:#aaa" id="stext">Insufficient data</div>
+    </div>
+    <div id="cpl-list" style="max-height:200px;overflow-y:auto;margin:6px 0"></div>
+    <div class="ctrl" style="margin-top:8px">
+      <button class="btn g" onclick="setupFinish()">✓ Finish Setup</button>
+      <button class="btn gr" onclick="setupReset()">Start Over</button>
     </div>
   </div>
 </div>
 
-<!-- SETTINGS PAGE -->
+<!-- SETTINGS -->
 <div id="settings" class="page">
-  <h2 style="margin-bottom:16px">Settings</h2>
-  <div class="settings-grid">
-    <div class="setting">
-      <label>Firing Mode</label>
-      <select id="firing_mode" onchange="updateSettings()">
+  <h2 style="margin-bottom:14px">Settings</h2>
+  <h3 style="color:#aaa;margin-bottom:8px;font-size:0.9em">Firing</h3>
+  <div class="sg" style="margin-bottom:16px">
+    <div class="set"><label>Firing Mode</label>
+      <select id="firing_mode" onchange="updSettings()">
         <option value="single">Single Fire</option>
         <option value="semi_auto">Semi-Auto</option>
-      </select>
-    </div>
-    <div class="setting">
-      <label>Confidence Threshold: <span class="value-label" id="val-conf">0.5</span></label>
-      <input type="range" min="0.1" max="1.0" step="0.05" value="0.5" id="confidence_threshold"
-             oninput="document.getElementById('val-conf').textContent=this.value" onchange="updateSettings()">
-    </div>
-    <div class="setting">
-      <label>Burst Length (s): <span class="value-label" id="val-burst">1.0</span></label>
-      <input type="range" min="0.1" max="5.0" step="0.1" value="1.0" id="burst_length"
-             oninput="document.getElementById('val-burst').textContent=this.value" onchange="updateSettings()">
-    </div>
-    <div class="setting">
-      <label>Reload Time (s): <span class="value-label" id="val-reload">10</span></label>
+      </select></div>
+    <div class="set"><label>Confidence: <span class="vl" id="vl-c">0.5</span></label>
+      <input type="range" min="0.1" max="1" step="0.05" value="0.5" id="confidence_threshold"
+             oninput="document.getElementById('vl-c').textContent=this.value" onchange="updSettings()"></div>
+    <div class="set"><label>Burst Length (s): <span class="vl" id="vl-b">1.0</span></label>
+      <input type="range" min="0.1" max="5" step="0.1" value="1" id="burst_length"
+             oninput="document.getElementById('vl-b').textContent=this.value" onchange="updSettings()"></div>
+    <div class="set"><label>Reload Time (s): <span class="vl" id="vl-r">10</span></label>
       <input type="range" min="1" max="60" step="1" value="10" id="reload_time"
-             oninput="document.getElementById('val-reload').textContent=this.value" onchange="updateSettings()">
-    </div>
-    <div class="setting">
-      <label>Semi-Auto Delay (s): <span class="value-label" id="val-semi">2.0</span></label>
-      <input type="range" min="0.5" max="10" step="0.5" value="2.0" id="semi_auto_delay"
-             oninput="document.getElementById('val-semi').textContent=this.value" onchange="updateSettings()">
-    </div>
-    <div class="setting">
-      <label>On-Target Tolerance (px): <span class="value-label" id="val-tol">20</span></label>
+             oninput="document.getElementById('vl-r').textContent=this.value" onchange="updSettings()"></div>
+    <div class="set"><label>Semi-Auto Delay (s): <span class="vl" id="vl-s">2</span></label>
+      <input type="range" min="0.5" max="10" step="0.5" value="2" id="semi_auto_delay"
+             oninput="document.getElementById('vl-s').textContent=this.value" onchange="updSettings()"></div>
+    <div class="set"><label>On-Target Tolerance (px): <span class="vl" id="vl-t">20</span></label>
       <input type="range" min="5" max="100" step="5" value="20" id="on_target_tolerance"
-             oninput="document.getElementById('val-tol').textContent=this.value" onchange="updateSettings()">
-    </div>
+             oninput="document.getElementById('vl-t').textContent=this.value" onchange="updSettings()"></div>
+  </div>
+  <h3 style="color:#aaa;margin-bottom:8px;font-size:0.9em">Camera</h3>
+  <div class="sg">
+    <div class="set"><label>Brightness (-1 to 1)</label>
+      <div style="display:flex;gap:6px;align-items:center">
+        <input type="range" min="-1" max="1" step="0.05" value="0" id="cam-brightness"
+               oninput="syncN('brightness',this.value)" onchange="updCam()">
+        <input type="number" id="num-brightness" value="0" step="0.05" min="-1" max="1"
+               oninput="syncS('brightness',this.value)" onchange="updCam()"></div></div>
+    <div class="set"><label>Contrast (0 to 2)</label>
+      <div style="display:flex;gap:6px;align-items:center">
+        <input type="range" min="0" max="2" step="0.05" value="1" id="cam-contrast"
+               oninput="syncN('contrast',this.value)" onchange="updCam()">
+        <input type="number" id="num-contrast" value="1" step="0.05" min="0" max="2"
+               oninput="syncS('contrast',this.value)" onchange="updCam()"></div></div>
+    <div class="set"><label>Saturation (0 to 2)</label>
+      <div style="display:flex;gap:6px;align-items:center">
+        <input type="range" min="0" max="2" step="0.05" value="1" id="cam-saturation"
+               oninput="syncN('saturation',this.value)" onchange="updCam()">
+        <input type="number" id="num-saturation" value="1" step="0.05" min="0" max="2"
+               oninput="syncS('saturation',this.value)" onchange="updCam()"></div></div>
+    <div class="set"><label>Sharpness (0 to 2)</label>
+      <div style="display:flex;gap:6px;align-items:center">
+        <input type="range" min="0" max="2" step="0.05" value="1" id="cam-sharpness"
+               oninput="syncN('sharpness',this.value)" onchange="updCam()">
+        <input type="number" id="num-sharpness" value="1" step="0.05" min="0" max="2"
+               oninput="syncS('sharpness',this.value)" onchange="updCam()"></div></div>
+    <div class="set"><label>EV Compensation (-4 to 4)</label>
+      <div style="display:flex;gap:6px;align-items:center">
+        <input type="range" min="-4" max="4" step="0.5" value="0" id="cam-ev"
+               oninput="syncN('ev',this.value)" onchange="updCam()">
+        <input type="number" id="num-ev" value="0" step="0.5" min="-4" max="4"
+               oninput="syncS('ev',this.value)" onchange="updCam()"></div></div>
   </div>
 </div>
 
-<!-- RECORDINGS PAGE -->
+<!-- RECORDINGS -->
 <div id="recordings" class="page">
-  <h2 style="margin-bottom:16px">Recordings</h2>
-  <button class="btn btn-gray" onclick="loadRecordings()" style="margin-bottom:12px">Refresh</button>
-  <div class="recordings-list" id="recordings-list">Loading...</div>
+  <h2 style="margin-bottom:14px">Recordings</h2>
+  <button class="btn gr" onclick="loadRecs()" style="margin-bottom:12px">Refresh</button>
+  <div class="rl" id="rl">Loading...</div>
 </div>
 
 <script>
-const canvas = document.getElementById('overlay');
-const ctx = canvas.getContext('2d');
-let zonePoints = [];
-let zoneClosed = false;
-let currentMode = 'live';
-let calibrationMode = false;
-let targetingActive = false;
-let dragState = null;
-let currentPan = 90, currentTilt = 90;
+// ── State ──────────────────────────────────────────────────────────────────
+let curPage   = 'live';
+let vMode     = 'add';
+let verts     = [];
+let zClosed   = false;
+let dragIdx   = -1;
+let dragOff   = {x:0,y:0};
+let tgtOn     = false;
+let curPhase  = null;
+let camInit   = false;
 
-function updateServoAngles(pan, tilt) {
-  currentPan = pan;
-  currentTilt = tilt;
-}
-
-function moveServo(pan_delta, tilt_delta) {
-  fetch('/servos/move', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({pan_delta, tilt_delta})
-  });
-}
-
+// ── Page Nav ───────────────────────────────────────────────────────────────
 function showPage(page, btn) {
-  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach(b=>b.classList.remove('active'));
   document.getElementById(page).classList.add('active');
   btn.classList.add('active');
-  calibrationMode = (page === 'calibration');
-  if (calibrationMode) {
-    fetch('/fov').then(r => r.json()).then(d => {
-      document.getElementById('val-hfov').textContent = d.h;
-      document.getElementById('val-vfov').textContent = d.v;
-    });
-  }
-  if (!calibrationMode && targetingActive) {
-    targetingActive = false;
-    fetch('/calibration/stop');
-    document.getElementById('btn-targeting').textContent = '▶ Start Targeting';
-    document.getElementById('btn-targeting').classList.remove('active-mode');
-  }
-  fetch('/mode/' + (calibrationMode ? 'calibration' : 'live'));
-  if (page === 'recordings') loadRecordings();
+  curPage = page;
+  if (page==='recordings') loadRecs();
+  if (page==='setup' && curPhase===null)
+    fetch('/setup/start').then(r=>r.json()).then(d=>applyPhase(d.phase));
 }
 
-function toggleMode(mode) {
-  const baseMode = calibrationMode ? 'calibration' : 'live';
-  if (currentMode === mode) {
-    currentMode = baseMode;
-    fetch('/mode/' + baseMode);
-    ['btn-zone','btn-zone-cal'].forEach(id => { const el = document.getElementById(id); if(el) el.classList.remove('active-mode'); });
-    ['btn-close-zone','btn-close-zone-cal'].forEach(id => { const el = document.getElementById(id); if(el) el.style.display = 'none'; });
-  } else {
-    currentMode = mode;
-    fetch('/mode/' + mode);
-    ['btn-zone','btn-zone-cal'].forEach(id => { const el = document.getElementById(id); if(el) el.classList.add('active-mode'); });
-    ['btn-close-zone','btn-close-zone-cal'].forEach(id => { const el = document.getElementById(id); if(el) el.style.display = 'inline-block'; });
-  }
+// ── Servo Move ─────────────────────────────────────────────────────────────
+function mv(pd,td){
+  fetch('/servos/move',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({pan_delta:pd,tilt_delta:td})});
 }
 
-function closeZone() {
-  if (zonePoints.length < 3) return;
-  zoneClosed = true;
-  const baseMode = calibrationMode ? 'calibration' : 'live';
-  currentMode = baseMode;
-  fetch('/mode/' + baseMode);
-  ['btn-zone','btn-zone-cal'].forEach(id => { const el = document.getElementById(id); if(el) el.classList.remove('active-mode'); });
-  ['btn-close-zone','btn-close-zone-cal'].forEach(id => { const el = document.getElementById(id); if(el) el.style.display = 'none'; });
-  // Clear preview canvas — backend will draw the zone from now on
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  const calCvs = document.getElementById('overlay-cal');
-  if (calCvs) calCvs.getContext('2d').clearRect(0, 0, calCvs.width, calCvs.height);
-  sendZone();
-}
-
-// ── Calibration canvas drag ──────────────────────────────────────────────────
-const calCanvas = document.getElementById('overlay-cal');
-if (calCanvas) {
-  const calCtx = calCanvas.getContext('2d');
-
-  calCanvas.addEventListener('mousedown', (e) => {
-    if (!zoneClosed) return;
-    const rect = calCanvas.getBoundingClientRect();
-    dragState = {
-      startX: Math.round(e.clientX - rect.left),
-      startY: Math.round(e.clientY - rect.top),
-      panAtStart: currentPan,
-      tiltAtStart: currentTilt
-    };
-  });
-
-  calCanvas.addEventListener('mouseup', (e) => {
-    if (!dragState) return;
-    const rect = calCanvas.getBoundingClientRect();
-    const x = Math.round(e.clientX - rect.left);
-    const y = Math.round(e.clientY - rect.top);
-    const dx = x - dragState.startX;
-    const dy = y - dragState.startY;
-    if (Math.abs(dx) > 2 || Math.abs(dy) > 2) {
-      fetch('/zone/drag', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          dx, dy,
-          pan_delta:  currentPan  - dragState.panAtStart,
-          tilt_delta: currentTilt - dragState.tiltAtStart,
-        })
-      });
-    }
-    dragState = null;
-  });
-
-  calCanvas.addEventListener('click', (e) => {
-    if (zoneClosed) return;
-    if (currentMode !== 'zone_draw') return;
-    const rect = calCanvas.getBoundingClientRect();
-    zonePoints.push([
-      Math.round(e.clientX - rect.left),
-      Math.round(e.clientY - rect.top)
-    ]);
+// ── Servo Bars ─────────────────────────────────────────────────────────────
+function updServoBars(pp,tp){
+  const pl = ((pp+100)/200*100).toFixed(1)+'%';
+  const tl = ((tp+100)/200*100).toFixed(1)+'%';
+  const pairs = [['pp','pi','tp','ti'],['pp-s','pi-s','tp-s','ti-s']];
+  pairs.forEach(([ppid,piid,tpid,tiid])=>{
+    const pe=document.getElementById(ppid),pii=document.getElementById(piid);
+    const te=document.getElementById(tpid),tii=document.getElementById(tiid);
+    if(pe)pe.textContent=pp+'%'; if(pii)pii.style.left=pl;
+    if(te)te.textContent=tp+'%'; if(tii)tii.style.left=tl;
   });
 }
 
-canvas.addEventListener('click', (e) => {
-  if (currentMode !== 'zone_draw' || zoneClosed) return;
-  const rect = canvas.getBoundingClientRect();
-  zonePoints.push([
-    Math.round(e.clientX - rect.left),
-    Math.round(e.clientY - rect.top)
-  ]);
+// ── Phase Management ───────────────────────────────────────────────────────
+function applyPhase(phase){
+  curPhase = phase;
+  ['ph-home','ph-draw','ph-forced','ph-extra'].forEach(id=>{
+    document.getElementById(id).style.display='none';
+  });
+  if(phase==='home'){
+    document.getElementById('ph-home').style.display='block';
+  } else if(phase==='draw'){
+    document.getElementById('ph-draw').style.display='block';
+    vmode('add');
+  } else if(['forced_L','forced_R','forced_up','forced_down'].includes(phase)){
+    document.getElementById('ph-forced').style.display='block';
+    const T={forced_L:'Step 3 of 6 — Left Pan Endpoint',
+             forced_R:'Step 4 of 6 — Right Pan Endpoint',
+             forced_up:'Step 5a of 6 — Tilt Up Endpoint',
+             forced_down:'Step 5b of 6 — Tilt Down Endpoint'};
+    const M={forced_L:'Camera moved to left pan limit. If zone is off-screen, pan right until visible, then drag vertices.',
+             forced_R:'Camera moved to right pan limit. If zone is off-screen, pan left until visible, then drag vertices.',
+             forced_up:'Camera moved to tilt up limit. Drag vertices to correct zone position.',
+             forced_down:'Camera moved to tilt down limit. Drag vertices to correct position. Camera returns home when done.'};
+    document.getElementById('ftitle').textContent=T[phase]||phase;
+    document.getElementById('fmsg').textContent=M[phase]||'';
+    document.getElementById('btn-df').textContent=
+      phase==='forced_down'?'✓ Done — Return to Home':'✓ Done';
+    vmode('move');
+  } else if(phase==='extra'){
+    document.getElementById('ph-extra').style.display='block';
+    vmode('move');
+    loadCalPoints();
+  }
+}
+
+function setupSetHome(){fetch('/setup/set_home').then(r=>r.json()).then(d=>applyPhase(d.phase));}
+function setupReset(){verts=[];zClosed=false;fetch('/setup/reset').then(r=>r.json()).then(d=>applyPhase(d.phase));}
+function clearZone(){verts=[];zClosed=false;sendZone();updDrawBtns();}
+function closeZone(){if(verts.length<3)return;zClosed=true;sendZone();updDrawBtns();}
+function beginForcedCal(){fetch('/setup/begin_forced_cal').then(r=>r.json()).then(d=>applyPhase(d.phase));}
+function saveForcedPt(){
+  fetch('/setup/save_forced_point',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({vertices:verts})}).then(r=>r.json()).then(d=>applyPhase(d.phase));
+}
+function addExtraPt(){
+  fetch('/setup/add_extra_point',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({vertices:verts})}).then(r=>r.json()).then(d=>{
+    updStrength(d); loadCalPoints();});
+}
+function setupFinish(){fetch('/setup/finish');curPhase=null;applyPhase(null);}
+function setDepth(v){
+  fetch('/setup/depth',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({depth_m:parseFloat(v)||null})});
+}
+function toggleTgt(){
+  tgtOn=!tgtOn;
+  ['btn-tgt','btn-tgt-e'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(el){el.textContent=tgtOn?'⏹ Stop Targeting':'▶ Targeting';
+           tgtOn?el.classList.add('on'):el.classList.remove('on');}
+  });
+  fetch(tgtOn?'/setup/targeting/start':'/setup/targeting/stop');
+}
+
+function updStrength(data){
+  const s=data.strength||{};
+  const fill=document.getElementById('sfill');
+  const text=document.getElementById('stext');
+  const n=data.n_points||s.n_points||0;
+  if(fill&&s.combined!=null){
+    fill.style.width=s.combined+'%';
+    text.textContent=`Combined: ${s.combined}% | Position: ${s.position_confidence}% | Coverage: ${s.coverage_score}% | Points: ${n}`;
+  } else if(text){
+    text.textContent=`${n} point(s) — need 3+ for strength metric`;
+  }
+}
+
+function loadCalPoints(){
+  fetch('/setup/cal_points').then(r=>r.json()).then(d=>{
+    const list=document.getElementById('cpl-list');
+    if(!list)return;
+    if(!d.points||!d.points.length){list.innerHTML='<p style="color:#666;font-size:0.85em">No points saved</p>';return;}
+    list.innerHTML=d.points.map((p,i)=>`
+      <div class="cpl" onclick="gotoCalPt(${p.index})">
+        <span>Point ${p.index+1} — Pan ${p.pan}° Tilt ${p.tilt}°</span>
+        <button class="btn r" style="padding:3px 8px;font-size:0.8em"
+          onclick="event.stopPropagation();removeCalPt(${p.index})">✕</button>
+      </div>`).join('');
+  });
+}
+
+function gotoCalPt(idx){
+  fetch('/setup/goto_point',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({index:idx})});
+}
+function removeCalPt(idx){
+  fetch('/setup/remove_point',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({index:idx})}).then(r=>r.json()).then(d=>{updStrength(d);loadCalPoints();});
+}
+
+// ── Vertex Mode ────────────────────────────────────────────────────────────
+function vmode(m){
+  vMode=m;
+  ['btn-add','btn-mv','btn-del'].forEach(id=>{
+    const el=document.getElementById(id);if(el)el.classList.remove('on');
+  });
+  const map={add:'btn-add',move:'btn-mv',delete:'btn-del'};
+  const el=document.getElementById(map[m]);if(el)el.classList.add('on');
+  document.getElementById('ov-setup').style.cursor=m==='move'?'grab':'crosshair';
+}
+
+function updDrawBtns(){
+  const cz=document.getElementById('btn-cz');
+  const dd=document.getElementById('btn-dd');
+  if(cz)cz.disabled=verts.length<3||zClosed;
+  if(dd)dd.disabled=!zClosed;
+}
+
+function sendZone(){
+  fetch('/setup/zone',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({vertices:verts,closed:zClosed})});
+}
+
+// ── Setup Canvas ───────────────────────────────────────────────────────────
+const sc=document.getElementById('ov-setup');
+
+sc.addEventListener('mousedown',e=>{
+  const r=sc.getBoundingClientRect();
+  const x=Math.round(e.clientX-r.left),y=Math.round(e.clientY-r.top);
+  if(vMode==='add'&&!zClosed){verts.push([x,y]);sendZone();updDrawBtns();}
+  else if(vMode==='delete'){
+    const i=nearV(x,y,15);
+    if(i>=0){verts.splice(i,1);if(verts.length<3)zClosed=false;sendZone();updDrawBtns();}
+  } else if(vMode==='move'){
+    dragIdx=nearV(x,y,20);
+    if(dragIdx>=0){dragOff={x:x-verts[dragIdx][0],y:y-verts[dragIdx][1]};sc.style.cursor='grabbing';}
+  }
+});
+sc.addEventListener('mousemove',e=>{
+  if(dragIdx<0)return;
+  const r=sc.getBoundingClientRect();
+  const x=Math.round(e.clientX-r.left),y=Math.round(e.clientY-r.top);
+  verts[dragIdx]=[x-dragOff.x,y-dragOff.y];
+});
+sc.addEventListener('mouseup',()=>{
+  if(dragIdx>=0){sendZone();dragIdx=-1;sc.style.cursor='grab';}
 });
 
-function clearZoneLocal() {
-  zonePoints = [];
-  zoneClosed = false;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  const calCvs = document.getElementById('overlay-cal');
-  if (calCvs) calCvs.getContext('2d').clearRect(0, 0, calCvs.width, calCvs.height);
-  fetch('/zone/clear');
-}
-
-function sendZone() {
-  fetch('/zone', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({points: zonePoints, closed: zoneClosed})
+function nearV(x,y,thresh){
+  let best=-1,bestD=thresh;
+  verts.forEach(([vx,vy],i)=>{
+    const d=Math.sqrt((x-vx)**2+(y-vy)**2);if(d<bestD){bestD=d;best=i;}
   });
+  return best;
 }
 
-function adjustFov(axis, delta) {
-  fetch('/fov').then(r => r.json()).then(d => {
-    const newVal = Math.round((d[axis] + delta) * 10) / 10;
-    const body = {};
-    body[axis] = newVal;
-    fetch('/fov', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body)
-    }).then(r => r.json()).then(d => {
-      document.getElementById('val-hfov').textContent = d.h;
-      document.getElementById('val-vfov').textContent = d.v;
+// ── Overlay Drawing ────────────────────────────────────────────────────────
+function drawOvs(d){
+  const cvs=[
+    {id:'ov-live', useServer:true},
+    {id:'ov-setup',useServer:curPhase!=='draw'},
+  ];
+  cvs.forEach(({id,useServer})=>{
+    const c=document.getElementById(id);if(!c)return;
+    const ctx=c.getContext('2d');
+    ctx.clearRect(0,0,c.width,c.height);
+
+    // Zone
+    const zv = useServer?(d.zone_px||[]):verts;
+    const zc = useServer?d.zone_closed:zClosed;
+    if(zv.length>=2) drawZone(ctx,zv,zc,zc?'#00ff00':'#00ffff');
+
+    // Off-screen arrow
+    if(useServer&&zv.length>0){
+      const cx=zv.reduce((s,p)=>s+p[0],0)/zv.length;
+      const cy=zv.reduce((s,p)=>s+p[1],0)/zv.length;
+      if(cx<0||cx>c.width||cy<0||cy>c.height) drawArrow(ctx,cx,cy,c.width,c.height);
+    }
+
+    // Detections
+    (d.detections||[]).forEach(det=>{
+      const col=det.in_zone?'#ff0000':'#ff8800';
+      ctx.strokeStyle=col;ctx.lineWidth=det.is_primary?3:1;
+      ctx.strokeRect(det.x1,det.y1,det.x2-det.x1,det.y2-det.y1);
+      ctx.fillStyle=col;ctx.font='12px sans-serif';
+      ctx.fillText('CAT'+(det.is_primary?' [TGT]':'')+' '+det.conf,det.x1,det.y1-4);
     });
+
+    // REC dot
+    if(d.recording){
+      ctx.fillStyle='#f00';ctx.beginPath();ctx.arc(20,20,8,0,2*Math.PI);ctx.fill();
+      ctx.fillStyle='#f00';ctx.font='bold 12px sans-serif';ctx.fillText('REC',32,25);
+    }
   });
 }
 
-function toggleTargeting() {
-  targetingActive = !targetingActive;
-  const btn = document.getElementById('btn-targeting');
-  if (targetingActive) {
-    fetch('/calibration/start');
-    btn.textContent = '⏹ Stop Targeting';
-    btn.classList.add('active-mode');
-  } else {
-    fetch('/calibration/stop');
-    btn.textContent = '▶ Start Targeting';
-    btn.classList.remove('active-mode');
-  }
+function drawZone(ctx,verts,closed,color){
+  if(!verts.length)return;
+  ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=2;
+  ctx.beginPath();ctx.moveTo(verts[0][0],verts[0][1]);
+  for(let i=1;i<verts.length;i++)ctx.lineTo(verts[i][0],verts[i][1]);
+  if(closed)ctx.closePath();ctx.stroke();
+  verts.forEach(([vx,vy])=>{ctx.beginPath();ctx.arc(vx,vy,5,0,2*Math.PI);ctx.fill();});
 }
 
-function updateSettings() {
-  fetch('/settings', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      firing_mode: document.getElementById('firing_mode').value,
-      burst_length: parseFloat(document.getElementById('burst_length').value),
-      reload_time: parseFloat(document.getElementById('reload_time').value),
-      semi_auto_delay: parseFloat(document.getElementById('semi_auto_delay').value),
-      confidence_threshold: parseFloat(document.getElementById('confidence_threshold').value),
-      on_target_tolerance: parseInt(document.getElementById('on_target_tolerance').value),
-    })
-  });
+function drawArrow(ctx,cx,cy,w,h){
+  const ex=Math.max(20,Math.min(w-20,cx));
+  const ey=Math.max(20,Math.min(h-20,cy));
+  const a=Math.atan2(cy-h/2,cx-w/2);
+  ctx.save();ctx.translate(ex,ey);ctx.rotate(a);
+  ctx.fillStyle='#ff0';ctx.beginPath();
+  ctx.moveTo(15,0);ctx.lineTo(-10,-8);ctx.lineTo(-10,8);
+  ctx.closePath();ctx.fill();ctx.restore();
+  ctx.fillStyle='#ff0';ctx.font='bold 11px sans-serif';
+  ctx.fillText('Zone →',Math.max(5,ex-20),Math.max(15,ey-10));
 }
 
-function drawOverlays(d) {
-  // Draw on both canvases
-  [canvas, document.getElementById('overlay-cal')].forEach(cvs => {
-    if (!cvs) return;
-    const c = cvs.getContext('2d');
-    c.clearRect(0, 0, cvs.width, cvs.height);
+// ── Settings ───────────────────────────────────────────────────────────────
+function updSettings(){
+  fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      firing_mode:document.getElementById('firing_mode').value,
+      burst_length:parseFloat(document.getElementById('burst_length').value),
+      reload_time:parseFloat(document.getElementById('reload_time').value),
+      semi_auto_delay:parseFloat(document.getElementById('semi_auto_delay').value),
+      confidence_threshold:parseFloat(document.getElementById('confidence_threshold').value),
+      on_target_tolerance:parseInt(document.getElementById('on_target_tolerance').value),
+    })});
+}
 
-    // Draw zone
-    if (d.zone_px && d.zone_px.length >= 2) {
-      c.strokeStyle = d.zone_closed ? '#00ff00' : '#00ffff';
-      c.lineWidth = 2;
-      c.beginPath();
-      c.moveTo(d.zone_px[0][0], d.zone_px[0][1]);
-      for (let i = 1; i < d.zone_px.length; i++) c.lineTo(d.zone_px[i][0], d.zone_px[i][1]);
-      if (d.zone_closed) c.closePath();
-      c.stroke();
-      d.zone_px.forEach(p => {
-        c.fillStyle = d.zone_closed ? '#00ff00' : '#00ffff';
-        c.beginPath();
-        c.arc(p[0], p[1], 5, 0, 2*Math.PI);
-        c.fill();
+function syncN(k,v){const el=document.getElementById('num-'+k);if(el)el.value=parseFloat(v).toFixed(2);}
+function syncS(k,v){const el=document.getElementById('cam-'+k);if(el)el.value=v;}
+function updCam(){
+  fetch('/camera',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      brightness:parseFloat(document.getElementById('cam-brightness').value),
+      contrast:parseFloat(document.getElementById('cam-contrast').value),
+      saturation:parseFloat(document.getElementById('cam-saturation').value),
+      sharpness:parseFloat(document.getElementById('cam-sharpness').value),
+      ev:parseFloat(document.getElementById('cam-ev').value),
+    })});
+}
+
+// ── Status Polling ─────────────────────────────────────────────────────────
+setInterval(()=>{
+  fetch('/status').then(r=>r.json()).then(d=>{
+    // Status bar
+    document.getElementById('da').className='dot '+(d.armed?'on':'');
+    document.getElementById('ta').textContent=d.armed?'Armed':'Disarmed';
+    document.getElementById('dc').className='dot '+(d.cats_detected>0?'warn':'');
+    document.getElementById('tc').textContent=d.cats_detected>0?d.cats_detected+' cat(s)':'No cats';
+    document.getElementById('dz').className='dot '+(d.cats_in_zone>0?'warn':'');
+    document.getElementById('tz').textContent=d.cats_in_zone>0?d.cats_in_zone+' in zone':'Zone clear';
+    document.getElementById('df').className='dot '+(d.firing?'warn':'');
+    document.getElementById('tf').textContent=d.firing?'💦 FIRING':'Idle';
+    document.getElementById('dr').className='dot '+(d.recording?'rec':'');
+    document.getElementById('tr').textContent=d.recording?'⏺ Recording':'Not recording';
+
+    // Servo bars
+    updServoBars(d.pan_pct||0,d.tilt_pct||0);
+
+    // Phase sync
+    if(d.setup_phase!==curPhase&&curPage==='setup') applyPhase(d.setup_phase);
+
+    // Strength update in extra phase
+    if(curPhase==='extra'&&d.strength) updStrength({strength:d.strength,n_points:d.n_cal_points});
+
+    // Camera settings init
+    if(d.cam&&!camInit){
+      camInit=true;
+      ['brightness','contrast','saturation','sharpness','ev'].forEach(k=>{
+        const s=document.getElementById('cam-'+k);
+        const n=document.getElementById('num-'+k);
+        if(s)s.value=d.cam[k];
+        if(n)n.value=parseFloat(d.cam[k]).toFixed(2);
       });
     }
 
-    // Draw zone preview (in-progress clicks before close)
-    if (!zoneClosed && zonePoints.length > 0) {
-      c.strokeStyle = '#00ffff';
-      c.lineWidth = 2;
-      c.beginPath();
-      c.moveTo(zonePoints[0][0], zonePoints[0][1]);
-      for (let i = 1; i < zonePoints.length; i++) c.lineTo(zonePoints[i][0], zonePoints[i][1]);
-      c.stroke();
-      zonePoints.forEach(p => {
-        c.fillStyle = '#00ffff';
-        c.beginPath();
-        c.arc(p[0], p[1], 5, 0, 2*Math.PI);
-        c.fill();
-      });
+    // Sync verts from server in forced/extra phases
+    if(['forced_L','forced_R','forced_up','forced_down','extra'].includes(curPhase)){
+      if(d.zone_px&&d.zone_px.length>0&&verts.length===0){
+        verts=d.zone_px.map(p=>[p[0],p[1]]);
+        zClosed=d.zone_closed;
+      }
     }
 
-    // Draw detections
-    if (d.detections) {
-      d.detections.forEach(det => {
-        const color = det.in_zone ? '#ff0000' : '#ff8800';
-        c.strokeStyle = color;
-        c.lineWidth = det.is_primary ? 3 : 1;
-        c.strokeRect(det.x1, det.y1, det.x2-det.x1, det.y2-det.y1);
-        c.fillStyle = color;
-        c.font = '12px sans-serif';
-        c.fillText(`CAT${det.is_primary ? ' [TARGET]' : ''} ${det.conf}`, det.x1, det.y1 - 4);
-      });
-    }
-
-    // Draw reticle
-    const rx = d.reticle_x, ry = d.reticle_y;
-    c.strokeStyle = '#ffff00';
-    c.lineWidth = 2;
-    c.beginPath();
-    c.arc(rx, ry, 20, 0, 2*Math.PI);
-    c.stroke();
-    c.beginPath();
-    c.moveTo(rx-30, ry); c.lineTo(rx+30, ry);
-    c.moveTo(rx, ry-30); c.lineTo(rx, ry+30);
-    c.stroke();
-
-    // REC indicator
-    if (d.recording) {
-      c.fillStyle = '#ff0000';
-      c.beginPath();
-      c.arc(20, 20, 8, 0, 2*Math.PI);
-      c.fill();
-      c.fillStyle = '#ff0000';
-      c.font = 'bold 12px sans-serif';
-      c.fillText('REC', 32, 25);
-    }
+    // Draw overlays
+    drawOvs(d);
   });
-}
+},200);
 
-setInterval(() => {
-  fetch('/status').then(r => r.json()).then(d => {
-    updateServoAngles(d.pan || 90, d.tilt || 90);
-    document.getElementById('dot-armed').className = 'dot ' + (d.armed ? 'on' : '');
-    document.getElementById('txt-armed').textContent = d.armed ? 'Armed' : 'Disarmed';
-    document.getElementById('dot-cats').className = 'dot ' + (d.cats_detected > 0 ? 'warn' : '');
-    document.getElementById('txt-cats').textContent = d.cats_detected > 0 ? d.cats_detected + ' cat(s)' : 'No cats';
-    document.getElementById('dot-zone').className = 'dot ' + (d.cats_in_zone > 0 ? 'warn' : '');
-    document.getElementById('txt-zone').textContent = d.cats_in_zone > 0 ? d.cats_in_zone + ' in zone' : 'Zone clear';
-    document.getElementById('dot-firing').className = 'dot ' + (d.firing ? 'warn' : '');
-    document.getElementById('txt-firing').textContent = d.firing ? '💦 FIRING' : 'Idle';
-    document.getElementById('dot-rec').className = 'dot ' + (d.recording ? 'rec' : '');
-    document.getElementById('txt-rec').textContent = d.recording ? '⏺ Recording' : 'Not recording';
-    if (d.fov_h) {
-      const hEl = document.getElementById('val-hfov');
-      const vEl = document.getElementById('val-vfov');
-      if (hEl) hEl.textContent = d.fov_h;
-      if (vEl) vEl.textContent = d.fov_v;
-    }
-    drawOverlays(d);
-  });
-}, 200);
-
-function loadRecordings() {
-  fetch('/recordings').then(r => r.json()).then(d => {
-    const list = document.getElementById('recordings-list');
-    if (d.recordings.length === 0) {
-      list.innerHTML = '<p style="color:#666">No recordings yet</p>';
-      return;
-    }
-    list.innerHTML = d.recordings.map(f => `
-      <div class="recording-item">
-        <span>${f}</span>
-        <a href="/recordings/${f}" target="_blank">
-          <button class="btn btn-blue">▶ Play</button>
-        </a>
-      </div>
-    `).join('');
+// ── Recordings ─────────────────────────────────────────────────────────────
+function loadRecs(){
+  fetch('/recordings').then(r=>r.json()).then(d=>{
+    const list=document.getElementById('rl');
+    if(!d.recordings.length){list.innerHTML='<p style="color:#666">No recordings yet</p>';return;}
+    list.innerHTML=d.recordings.map(f=>`
+      <div class="ri"><span>${f}</span>
+        <a href="/recordings/${f}" target="_blank"><button class="btn b">▶ Play</button></a>
+      </div>`).join('');
   });
 }
 </script>
