@@ -233,12 +233,26 @@ def servo_pct(angle, center, rang):
 zone_vertices = []
 zone_closed   = False
 
+def get_setup_zone():
+    """Return exact saved zone for current servo position, or interpolated if not saved."""
+    pan, tilt = servo_angles["pan"], servo_angles["tilt"]
+    pts = zone_cal["calibration_points"]
+    if not pts:
+        return zone_vertices, zone_closed, False
+    # Check for exact saved point at current position
+    exact = next((p for p in pts
+                  if abs(p["pan"]-pan)<0.5 and abs(p["tilt"]-tilt)<0.5), None)
+    if exact:
+        return exact["vertices"], True, True  # vertices, closed, is_exact
+    # Interpolate
+    interp = interpolate_zone(pan, tilt)
+    if interp:
+        return interp, True, False
+    return zone_vertices, zone_closed, False
+
 def get_current_zone():
-    if zone_cal["calibration_points"]:
-        interp = interpolate_zone(servo_angles["pan"], servo_angles["tilt"])
-        if interp:
-            return interp, True
-    return zone_vertices, zone_closed
+    verts, closed, _ = get_setup_zone()
+    return verts, closed
 
 def point_in_zone(cx, cy):
     verts, closed = get_current_zone()
@@ -463,6 +477,8 @@ def status():
                  "is_primary":d["id"]==tracking["primary_target_id"]}
                 for d in latest_detections]
     zone_px, z_closed = get_current_zone()
+    setup_verts, setup_closed, is_exact = get_setup_zone()
+    strength = compute_calibration_strength()
     return {
         "armed":state["armed"],"setup_phase":state["setup_phase"],
         "cats_detected":cats,"cats_in_zone":in_z,
@@ -472,8 +488,9 @@ def status():
         "pan_pct":servo_pct(servo_angles["pan"],PAN_CENTER,PAN_RANGE),
         "tilt_pct":servo_pct(servo_angles["tilt"],TILT_CENTER,TILT_RANGE),
         "detections":dets,"zone_px":zone_px,"zone_closed":z_closed,
+        "setup_zone":setup_verts,"setup_zone_closed":setup_closed,"setup_zone_exact":is_exact,
         "n_cal_points":len(zone_cal["calibration_points"]),
-        "strength":compute_calibration_strength(),
+        "strength":strength,
         "cam":cam_settings,"depth_m":zone_cal["depth_m"],
     }
 
@@ -797,10 +814,14 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
     <p>Click to place vertices. Close zone when done, then begin calibration.</p>
     <div class="ctrl">
       <button class="btn b on" id="btn-add" onclick="vmode('add')">+ Add</button>
-      <button class="btn b" id="btn-mv" onclick="toggleVertMode()">↔ Move Vertices</button>
       <button class="btn r" id="btn-del" onclick="vmode('delete')">✕ Delete</button>
       <button class="btn gr" onclick="clearZone()">Clear All</button>
       <button class="btn y" id="btn-cz" onclick="closeZone()" disabled>Close Zone</button>
+    </div>
+    <div style="margin:8px 0;font-size:0.85em">
+      Depth to zone center (m, optional):
+      <input type="number" id="depth-in" step="0.1" min="0.1" style="width:70px"
+             onchange="setDepth(this.value)">
     </div>
     <div class="ctrl" style="margin-top:4px">
       <button class="btn g" id="btn-dd" onclick="beginForcedCal()" disabled>✓ Done — Begin Calibration</button>
@@ -812,14 +833,9 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
     <h3 id="ftitle">Forced Calibration</h3>
     <p id="fmsg"></p>
     <div class="ctrl">
-      <button class="btn b" id="btn-mv" onclick="toggleVertMode()">↔ Move Vertices</button>
       <button class="btn y" id="btn-tgt" onclick="toggleTgt()">▶ Targeting</button>
     </div>
-    <div style="margin:8px 0;font-size:0.85em">
-      Depth to zone center (m, optional):
-      <input type="number" id="depth-in" step="0.1" min="0.1" style="width:70px"
-             onchange="setDepth(this.value)">
-    </div>
+    <p style="font-size:0.82em;color:#888;margin-top:4px">Drag vertices to move them. Click inside zone and drag to move the whole zone.</p>
     <button class="btn g" id="btn-df" onclick="saveForcedPt()">✓ Done</button>
     <button class="btn gr" style="margin-left:8px" onclick="setupReset()">Start Over</button>
   </div>
@@ -827,8 +843,8 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
   <div id="ph-extra" class="ph" style="display:none">
     <h3>Step 6 — Additional Calibration Points</h3>
     <p>Pan/tilt to new positions and save points. Add at least 4 more for full strength.</p>
+    <p style="font-size:0.82em;color:#888;margin-top:4px">Drag vertices to move them. Click inside zone and drag to move the whole zone.</p>
     <div class="ctrl">
-      <button class="btn b" id="btn-mv-e" onclick="toggleVertMode()">↔ Move Vertices</button>
       <button class="btn y" id="btn-tgt-e" onclick="toggleTgt()">▶ Targeting</button>
       <button class="btn g" onclick="addExtraPt()">📍 Save Point Here</button>
     </div>
@@ -968,18 +984,16 @@ function applyPhase(phase){
              forced_R:'Step 4 of 6 — Right Pan Endpoint (visual right)',
              forced_up:'Step 5a of 6 — Tilt Up Endpoint',
              forced_down:'Step 5b of 6 — Tilt Down Endpoint'};
-    const M={forced_L:'Camera moved to visual left limit. If zone is off-screen, pan right until visible, then drag zone or vertices to correct position.',
-             forced_R:'Camera moved to visual right limit. If zone is off-screen, pan left until visible, then drag zone or vertices to correct position.',
+    const M={forced_L:'Camera moved to visual left limit. If zone is off-screen, pan right until visible, then drag zone or vertices.',
+             forced_R:'Camera moved to visual right limit. If zone is off-screen, pan left until visible, then drag zone or vertices.',
              forced_up:'Camera tilted up to limit. Drag zone or vertices to correct position.',
              forced_down:'Camera tilted down to limit. Drag zone or vertices to correct position. Camera returns home when done.'};
     document.getElementById('ftitle').textContent=T[phase]||phase;
     document.getElementById('fmsg').textContent=M[phase]||'';
     document.getElementById('btn-df').textContent=
       phase==='forced_down'?'✓ Done — Return to Home':'✓ Done';
-    vmode('move');
   } else if(phase==='extra'){
     document.getElementById('ph-extra').style.display='block';
-    vmode('move');
     loadCalPoints();
   }
 }
@@ -1018,16 +1032,19 @@ function updStrength(data){
   const fill=document.getElementById('sfill');
   const text=document.getElementById('stext');
   const pts=document.getElementById('spts');
-  const n=data.n_points||s.n_points||0;
+  const n=data.n_points!==undefined?data.n_points:(s.n_points||0);
   if(pts) pts.textContent=`${n} calibration point${n!==1?'s':''} saved`;
-  if(fill){
-    if(s.combined!=null){
-      fill.style.width=s.combined+'%';
-      if(text) text.textContent=`Combined: ${s.combined}% | Position: ${s.position_confidence}% | Coverage: ${s.coverage_score}%`;
-    } else {
-      fill.style.width='0%';
-      if(text) text.textContent=`${n} point(s) — need 3+ for strength metric`;
-    }
+  if(!fill||!text) return;
+  if(s.combined!=null){
+    fill.style.width=s.combined+'%';
+    text.innerHTML=
+      `<b style="color:#4af">Combined: ${s.combined}%</b><br>`+
+      `LOOCV Position: ${s.position_confidence}%<br>`+
+      `Coverage: ${s.coverage_score}%`+
+      (n<8?`<br><span style="color:#fa0">⚠ Add ${8-n} more point${8-n!==1?'s':''} to unlock full strength</span>`:'');
+  } else {
+    fill.style.width='0%';
+    text.textContent=n<3?`Need ${3-n} more point${3-n!==1?'s':''} for LOOCV assessment`:'Calculating...';
   }
 }
 
@@ -1078,20 +1095,11 @@ function sendZone(){
 
 // ── Setup Canvas ───────────────────────────────────────────────────────────
 const sc=document.getElementById('ov-setup');
-let vertMode = false;  // false = whole-zone drag, true = vertex drag
 let zoneDrag = false;
 let zoneDragStart = null;
 let zoneDragOrigin = null;
-
-function toggleVertMode(){
-  vertMode = !vertMode;
-  const btn = document.getElementById('btn-mv');
-  if(btn){
-    btn.textContent = vertMode ? '↔ Vertex Mode ON' : '↔ Move Vertices';
-    vertMode ? btn.classList.add('on') : btn.classList.remove('on');
-  }
-  sc.style.cursor = vertMode ? 'crosshair' : (zClosed ? 'grab' : 'crosshair');
-}
+let lastServerPan = null;
+let lastServerTilt = null;
 
 function ptInZone(x, y){
   if(verts.length < 3) return false;
@@ -1106,36 +1114,36 @@ function ptInZone(x, y){
 sc.addEventListener('mousedown',e=>{
   const r=sc.getBoundingClientRect();
   const x=Math.round(e.clientX-r.left),y=Math.round(e.clientY-r.top);
-  if(vMode==='add'&&!zClosed&&!vertMode){
+
+  if(vMode==='add'&&!zClosed){
     verts.push([x,y]);
     sendZone();
     updDrawBtns();
     return;
   }
-  if(vMode==='delete'&&!vertMode){
+  if(vMode==='delete'){
     const i=nearV(x,y,15);
     if(i>=0){verts.splice(i,1);if(verts.length<3)zClosed=false;sendZone();updDrawBtns();}
     return;
   }
-  if(vertMode){
-    // vertex drag mode
-    dragIdx=nearV(x,y,20);
-    if(dragIdx>=0){dragOff={x:x-verts[dragIdx][0],y:y-verts[dragIdx][1]};sc.style.cursor='grabbing';}
-  } else if(zClosed){
-    // whole zone drag
-    if(ptInZone(x,y)||nearV(x,y,15)>=0){
-      zoneDrag=true;
-      zoneDragStart={x,y};
-      zoneDragOrigin=verts.map(v=>[v[0],v[1]]);
-      sc.style.cursor='grabbing';
-    }
+  // Default: vertex grab takes priority, then whole zone drag
+  const vi = nearV(x,y,15);
+  if(vi>=0){
+    dragIdx=vi;
+    dragOff={x:x-verts[vi][0],y:y-verts[vi][1]};
+    sc.style.cursor='grabbing';
+  } else if(zClosed && ptInZone(x,y)){
+    zoneDrag=true;
+    zoneDragStart={x,y};
+    zoneDragOrigin=verts.map(v=>[v[0],v[1]]);
+    sc.style.cursor='grabbing';
   }
 });
 
 sc.addEventListener('mousemove',e=>{
   const r=sc.getBoundingClientRect();
   const x=Math.round(e.clientX-r.left),y=Math.round(e.clientY-r.top);
-  if(vertMode&&dragIdx>=0){
+  if(dragIdx>=0){
     verts[dragIdx]=[x-dragOff.x,y-dragOff.y];
   } else if(zoneDrag&&zoneDragStart&&zoneDragOrigin){
     const dx=x-zoneDragStart.x, dy=y-zoneDragStart.y;
@@ -1144,7 +1152,7 @@ sc.addEventListener('mousemove',e=>{
 });
 
 sc.addEventListener('mouseup',()=>{
-  if(vertMode&&dragIdx>=0){sendZone();dragIdx=-1;sc.style.cursor='crosshair';}
+  if(dragIdx>=0){sendZone();dragIdx=-1;sc.style.cursor=zClosed?'grab':'crosshair';}
   else if(zoneDrag){sendZone();zoneDrag=false;zoneDragStart=null;zoneDragOrigin=null;sc.style.cursor='grab';}
 });
 
@@ -1167,11 +1175,13 @@ function drawOvs(d){
     const ctx=c.getContext('2d');
     ctx.clearRect(0,0,c.width,c.height);
 
-    // Zone — in draw phase always use local verts; in other phases use server zone_px
-    const useLocal = (curPhase==='draw') || (!zClosed && verts.length>0);
-    const zv = useLocal ? verts : (id==='ov-live' ? (d.zone_px||[]) : (verts.length>0?verts:(d.zone_px||[])));
+    // Zone — in draw phase use local verts; in calibration phases use local verts (synced from server)
+    const inCalPhase = ['forced_L','forced_R','forced_up','forced_down','extra'].includes(curPhase);
+    const useLocal = (id==='ov-setup') && (curPhase==='draw' || inCalPhase);
+    const zv = useLocal ? verts : (d.zone_px||[]);
     const zc = useLocal ? zClosed : d.zone_closed;
-    if(zv.length>=1) drawZone(ctx,zv,zc,zc?'#00ff00':'#00ffff');
+    const zColor = inCalPhase && d.setup_zone_exact ? '#00ff88' : (zc?'#00ff00':'#00ffff');
+    if(zv.length>=1) drawZone(ctx,zv,zc,zColor);
 
     // Off-screen arrow
     if(useServer&&zv.length>0){
@@ -1261,6 +1271,19 @@ setInterval(()=>{
 
     // Servo bars
     updServoBars(d.pan_pct||0,d.tilt_pct||0);
+
+    // Sync verts from server when servo position changes (camera moved)
+    const inSetupCalPhase = ['forced_L','forced_R','forced_up','forced_down','extra'].includes(curPhase);
+    if(inSetupCalPhase && d.setup_zone && d.setup_zone.length > 0){
+      const panChanged = lastServerPan !== null && Math.abs(d.pan - lastServerPan) > 0.3;
+      const tiltChanged = lastServerTilt !== null && Math.abs(d.tilt - lastServerTilt) > 0.3;
+      if(panChanged || tiltChanged || verts.length === 0){
+        verts = d.setup_zone.map(p=>[p[0],p[1]]);
+        zClosed = d.setup_zone_closed;
+      }
+    }
+    lastServerPan = d.pan;
+    lastServerTilt = d.tilt;
 
     // Phase sync
     if(d.setup_phase!==curPhase&&curPage==='setup') applyPhase(d.setup_phase);
