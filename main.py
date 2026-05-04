@@ -152,8 +152,8 @@ def capture_loop():
     global latest_frame
     while True:
         frame = picam2.capture_array()
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-        frame = cv2.flip(frame, -1)  # flip both axes = 180° rotation, preserves color
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
+        frame = cv2.flip(frame, -1)
         with frame_lock:
             latest_frame = frame.copy()
 
