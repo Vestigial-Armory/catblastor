@@ -27,11 +27,84 @@ FOV_FILE = Path("/home/wolfhard/catblastor/fov_calibration.json")
 RECORDINGS_DIR.mkdir(exist_ok=True)
 HLS_DIR = Path("/tmp/catblastor_hls")
 HLS_DIR.mkdir(exist_ok=True)
-PIPE_PATH = "/tmp/catblastor_pipe"
 
-# Create named pipe for ffmpeg input
-if not os.path.exists(PIPE_PATH):
-    os.mkfifo(PIPE_PATH)
+def start_ffmpeg_hls():
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-pixel_format", "bgr24",
+        "-video_size", f"{FRAME_W}x{FRAME_H}",
+        "-framerate", "15",
+        "-i", "tcp://127.0.0.1:12345?listen",
+        "-vf", "format=yuv420p",
+        "-c:v", "h264_v4l2m2m",
+        "-b:v", "1000k",
+        "-g", "15",
+        "-f", "hls",
+        "-hls_time", "0.5",
+        "-hls_list_size", "4",
+        "-hls_flags", "delete_segments+append_list",
+        str(HLS_DIR / "stream.m3u8")
+    ]
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def hls_writer_loop():
+    import socket
+    # Wait for ffmpeg to start listening
+    time.sleep(2.0)
+    while True:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect(("127.0.0.1", 12345))
+            print("HLS writer connected to ffmpeg")
+            break
+        except ConnectionRefusedError:
+            time.sleep(0.5)
+
+    while True:
+        with frame_lock:
+            if latest_frame is None:
+                time.sleep(0.01)
+                continue
+            frame = latest_frame.copy()
+
+        # Draw overlays
+        if len(state["zone_points"]) >= 2:
+            pixel_pts = [world_angle_to_pixel(p[0], p[1]) for p in state["zone_points"]]
+            pts = np.array(pixel_pts, dtype=np.int32)
+            color = (0, 255, 0) if state["zone_closed"] else (0, 255, 255)
+            cv2.polylines(frame, [pts], isClosed=state["zone_closed"], color=color, thickness=2)
+            for p in pixel_pts:
+                cv2.circle(frame, p, 5, color, -1)
+
+        with detection_lock:
+            detections = list(latest_detections)
+        for d in detections:
+            color = (0, 0, 255) if d["in_zone"] else (0, 165, 255)
+            is_primary = d["id"] == tracking["primary_target_id"]
+            thickness = 3 if is_primary else 1
+            cv2.rectangle(frame, (d["x1"], d["y1"]), (d["x2"], d["y2"]), color, thickness)
+            label = f'CAT {"[TARGET]" if is_primary else ""} {d["conf"]:.2f}'
+            cv2.putText(frame, label, (d["x1"], d["y1"]-10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        rx, ry = calibration_state["reticle_x"], calibration_state["reticle_y"]
+        cv2.circle(frame, (rx, ry), 20, (0, 255, 255), 2)
+        cv2.line(frame, (rx-30, ry), (rx+30, ry), (0, 255, 255), 1)
+        cv2.line(frame, (rx, ry-30), (rx, ry+30), (0, 255, 255), 1)
+
+        if recording["active"]:
+            cv2.circle(frame, (20, 20), 8, (0, 0, 255), -1)
+            cv2.putText(frame, "REC", (32, 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+        try:
+            sock.sendall(frame.tobytes())
+        except (BrokenPipeError, OSError):
+            print("HLS writer disconnected, retrying...")
+            break
+
+        time.sleep(1/15)
 
 # Mutable FOV — updated by zone drag calibration
 fov = {"h": 66.0, "v": 41.0}
@@ -394,81 +467,6 @@ def recording_loop():
 
         time.sleep(1/15)
 
-# ─── HLS Streaming ───────────────────────────────────────────────────────────
-hls_pipe = None
-
-def start_ffmpeg_hls():
-    global hls_pipe
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "rawvideo",
-        "-pixel_format", "bgr24",
-        "-video_size", f"{FRAME_W}x{FRAME_H}",
-        "-framerate", "15",
-        "-i", PIPE_PATH,
-        "-vf", "format=yuv420p",
-        "-c:v", "h264_v4l2m2m",
-        "-b:v", "1000k",
-        "-g", "15",
-        "-f", "hls",
-        "-hls_time", "0.5",
-        "-hls_list_size", "4",
-        "-hls_flags", "delete_segments+append_list",
-        str(HLS_DIR / "stream.m3u8")
-    ]
-    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    time.sleep(1.0)
-    hls_pipe = open(PIPE_PATH, "wb")
-
-def hls_writer_loop():
-    global hls_pipe
-    while hls_pipe is None:
-        time.sleep(0.1)
-    while True:
-        with frame_lock:
-            if latest_frame is None:
-                time.sleep(0.01)
-                continue
-            frame = latest_frame.copy()
-
-        # Draw overlays
-        if len(state["zone_points"]) >= 2:
-            pixel_pts = [world_angle_to_pixel(p[0], p[1]) for p in state["zone_points"]]
-            pts = np.array(pixel_pts, dtype=np.int32)
-            color = (0, 255, 0) if state["zone_closed"] else (0, 255, 255)
-            cv2.polylines(frame, [pts], isClosed=state["zone_closed"], color=color, thickness=2)
-            for p in pixel_pts:
-                cv2.circle(frame, p, 5, color, -1)
-
-        with detection_lock:
-            detections = list(latest_detections)
-        for d in detections:
-            color = (0, 0, 255) if d["in_zone"] else (0, 165, 255)
-            is_primary = d["id"] == tracking["primary_target_id"]
-            thickness = 3 if is_primary else 1
-            cv2.rectangle(frame, (d["x1"], d["y1"]), (d["x2"], d["y2"]), color, thickness)
-            label = f'CAT {"[TARGET]" if is_primary else ""} {d["conf"]:.2f}'
-            cv2.putText(frame, label, (d["x1"], d["y1"]-10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-        rx, ry = calibration_state["reticle_x"], calibration_state["reticle_y"]
-        cv2.circle(frame, (rx, ry), 20, (0, 255, 255), 2)
-        cv2.line(frame, (rx-30, ry), (rx+30, ry), (0, 255, 255), 1)
-        cv2.line(frame, (rx, ry-30), (rx, ry+30), (0, 255, 255), 1)
-
-        if recording["active"]:
-            cv2.circle(frame, (20, 20), 8, (0, 0, 255), -1)
-            cv2.putText(frame, "REC", (32, 26),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-
-        try:
-            hls_pipe.write(frame.tobytes())
-            hls_pipe.flush()
-        except BrokenPipeError:
-            break
-
-        time.sleep(1/15)
-
 # ─── Start Threads ───────────────────────────────────────────────────────────
 threading.Thread(target=capture_loop,        daemon=True).start()
 threading.Thread(target=inference_loop,      daemon=True).start()
@@ -478,7 +476,6 @@ threading.Thread(target=calibration_loop,    daemon=True).start()
 threading.Thread(target=recording_loop,      daemon=True).start()
 threading.Thread(target=home_position_loop,  daemon=True).start()
 threading.Thread(target=start_ffmpeg_hls,    daemon=True).start()
-time.sleep(1.5)
 threading.Thread(target=hls_writer_loop,     daemon=True).start()
 
 # ─── FastAPI ─────────────────────────────────────────────────────────────────
