@@ -45,7 +45,8 @@ def save_cam_settings():
     CAM_FILE.write_text(json.dumps(cam_settings))
 
 # ─── Zone Calibration ────────────────────────────────────────────────────────
-zone_cal = {"home_pan":90.0,"home_tilt":90.0,"depth_m":None,"calibration_points":[]}
+zone_cal = {"home_pan":90.0,"home_tilt":90.0,"depth_m":None,
+            "calibration_points":[],"home_vertices":[],"home_closed":False}
 if ZONE_CAL_FILE.exists():
     zone_cal.update(json.loads(ZONE_CAL_FILE.read_text()))
 
@@ -300,8 +301,8 @@ def servo_pct(angle, center, rang):
     return round((angle-center)/rang*100.0, 1)
 
 # ─── Zone Runtime State ──────────────────────────────────────────────────────
-zone_vertices = []
-zone_closed   = False
+zone_vertices = list(zone_cal.get("home_vertices", []))
+zone_closed   = bool(zone_cal.get("home_closed", False))
 
 def get_setup_zone():
     """Return exact saved zone for current servo position, or interpolated if not saved."""
@@ -616,10 +617,14 @@ def interp_debug():
 
 @app.get("/setup/start")
 def setup_start():
-    # If calibration points exist, resume in extra phase instead of restarting
-    if zone_cal["calibration_points"] and zone_vertices:
+    has_cal = len(zone_cal["calibration_points"]) > 0
+    has_zone = len(zone_vertices) >= 3 or len(zone_cal.get("home_vertices",[])) >= 3
+    if has_cal and has_zone:
         state["setup_phase"] = "extra"
         return {"phase":"extra","resuming":True}
+    if has_zone and not has_cal:
+        state["setup_phase"] = "draw"
+        return {"phase":"draw","resuming":False}
     state["setup_phase"] = "home"
     return {"phase":"home","resuming":False}
 
@@ -638,34 +643,39 @@ async def setup_zone(request: Request):
     data = await request.json()
     zone_vertices = data.get("vertices",[])
     zone_closed   = data.get("closed",False)
-    # If in calibration phase and zone is closed, save/update at current grid position
-    if state["setup_phase"] in ("forced_L","forced_R","forced_up","forced_down","extra"):
-        if zone_closed and len(zone_vertices) >= 3:
-            gp = grid_snap(servo_angles["pan"])
-            gt = grid_snap(servo_angles["tilt"])
-            # Remove existing point at this position and replace with user's version
-            zone_cal["calibration_points"] = [
-                p for p in zone_cal["calibration_points"]
-                if not (abs(p["pan"]-gp)<0.1 and abs(p["tilt"]-gt)<0.1)
-            ]
-            zone_cal["calibration_points"].append({
-                "pan": gp, "tilt": gt,
-                "vertices": [list(v) for v in zone_vertices]
-            })
-            save_zone_cal()
+    # Always persist the home vertices so they survive restart
+    zone_cal["home_vertices"] = [list(v) for v in zone_vertices]
+    zone_cal["home_closed"]   = zone_closed
+    # If zone is closed and we have calibration points, save/update at EXACT current servo position
+    if zone_closed and len(zone_vertices) >= 3:
+        pan = round(servo_angles["pan"], 1)
+        tilt = round(servo_angles["tilt"], 1)
+        zone_cal["calibration_points"] = [
+            p for p in zone_cal["calibration_points"]
+            if not (abs(p["pan"]-pan)<0.5 and abs(p["tilt"]-tilt)<0.5)
+        ]
+        zone_cal["calibration_points"].append({
+            "pan": pan, "tilt": tilt,
+            "vertices": [list(v) for v in zone_vertices]
+        })
+    save_zone_cal()
     return {"status":"ok","n_verts":len(zone_vertices)}
 
 @app.get("/setup/begin_forced_cal")
 def begin_forced_cal():
     if zone_closed and len(zone_vertices) >= 3:
+        zone_cal["home_vertices"] = [list(v) for v in zone_vertices]
+        zone_cal["home_closed"]   = True
+        hp = round(zone_cal["home_pan"], 1)
+        ht = round(zone_cal["home_tilt"], 1)
         zone_cal["calibration_points"] = [{
-            "pan":zone_cal["home_pan"],"tilt":zone_cal["home_tilt"],
-            "vertices":[list(v) for v in zone_vertices]}]
+            "pan": hp, "tilt": ht,
+            "vertices": [list(v) for v in zone_vertices]}]
         save_zone_cal()
     state["setup_phase"] = "forced_L"
     def go():
         time.sleep(0.5)
-        move_servos(PAN_MAX, zone_cal["home_tilt"], slow=True)  # PAN_MAX = visual left (camera flipped)
+        move_servos(PAN_MAX, zone_cal["home_tilt"], slow=True)
     threading.Thread(target=go, daemon=True).start()
     return {"phase":"forced_L"}
 
@@ -741,14 +751,18 @@ async def set_depth(request: Request):
 
 @app.get("/setup/finish")
 def setup_finish():
-    state["setup_phase"] = None; return {"status":"complete"}
+    state["setup_phase"] = None
+    return {"status":"complete"}
 
 @app.get("/setup/reset")
 def setup_reset():
     global zone_vertices, zone_closed
     zone_cal["calibration_points"] = []
-    zone_cal["home_pan"]  = 90.0; zone_cal["home_tilt"] = 90.0
-    zone_cal["depth_m"]   = None
+    zone_cal["home_pan"]      = 90.0
+    zone_cal["home_tilt"]     = 90.0
+    zone_cal["depth_m"]       = None
+    zone_cal["home_vertices"] = []
+    zone_cal["home_closed"]   = False
     zone_vertices = []; zone_closed = False
     save_zone_cal(); state["setup_phase"] = "home"
     move_servos(PAN_CENTER, TILT_CENTER)
@@ -957,7 +971,7 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
     </div>
     <div class="ctrl" style="margin-top:4px">
       <button class="btn g" id="btn-dd" onclick="beginForcedCal()" disabled>✓ Done — Begin Calibration</button>
-      <button class="btn gr" onclick="setupReset()">Start Over</button>
+      <button class="btn gr" onclick="confirmReset()">Start Over</button>
     </div>
   </div>
 
@@ -967,23 +981,19 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
     <div class="ctrl">
       <button class="btn y" id="btn-tgt" onclick="toggleTgt()">▶ Targeting</button>
     </div>
-    <p style="font-size:0.82em;color:#888;margin-top:4px">Drag vertices to move them. Click inside zone and drag to move the whole zone.</p>
+    <p style="font-size:0.82em;color:#888;margin-top:4px">Drag zone or vertices to correct position.</p>
     <button class="btn g" id="btn-df" onclick="saveForcedPt()">✓ Done</button>
-    <button class="btn gr" style="margin-left:8px" onclick="setupReset()">Start Over</button>
+    <button class="btn gr" style="margin-left:8px" onclick="confirmReset()">Start Over</button>
   </div>
 
   <div id="ph-extra" class="ph" style="display:none">
-    <h3>Additional Calibration Points</h3>
-    <p>Pan/tilt to a position, adjust zone if needed, then save the point.</p>
+    <p style="font-size:0.85em;color:#aaa">Pan/tilt anywhere, drag zone to correct it, then save the point.</p>
     <div class="ctrl">
       <button class="btn y" id="btn-tgt-e" onclick="toggleTgt()">▶ Targeting</button>
       <button class="btn g" onclick="savePointHere()">📍 Save Point Here</button>
+      <button class="btn gr" onclick="confirmReset()">Start Over</button>
     </div>
     <div id="interp-debug" style="font-size:0.78em;color:#aaa;margin:6px 0;padding:6px;background:#111;border-radius:3px;line-height:1.6"></div>
-    <div class="ctrl" style="margin-top:8px">
-      <button class="btn g" onclick="setupFinish()">✓ Finish Setup</button>
-      <button class="btn gr" onclick="setupReset()">Start Over</button>
-    </div>
   </div>
 
   <!-- Settings inside setup for live preview -->
@@ -1089,9 +1099,27 @@ function showPage(page, btn) {
   document.getElementById(page).classList.add('active');
   btn.classList.add('active');
   curPage = page;
-  if (page==='recordings') loadRecs();
-  if (page==='setup' && curPhase===null)
-    fetch('/setup/start').then(r=>r.json()).then(d=>applyPhase(d.phase));
+  if(page==='recordings') loadRecs();
+  if(page==='setup'){
+    // When entering setup, always get current state and sync verts from server
+    fetch('/setup/start').then(r=>r.json()).then(d=>{
+      applyPhase(d.phase);
+      // Immediately sync verts from server zone data
+      fetch('/status').then(r=>r.json()).then(s=>{
+        if(s.setup_zone && s.setup_zone.length > 0){
+          verts = s.setup_zone.map(p=>[p[0],p[1]]);
+          zClosed = s.setup_zone_closed;
+        }
+        lastServerPan = s.pan;
+        lastServerTilt = s.tilt;
+      });
+    });
+  }
+  if(page!=='setup'){
+    // When leaving setup, ensure setup_phase is cleared
+    fetch('/setup/finish');
+    curPhase = null;
+  }
 }
 
 // ── Servo Move ─────────────────────────────────────────────────────────────
@@ -1145,6 +1173,10 @@ function applyPhase(phase){
 }
 
 function setupSetHome(){fetch('/setup/set_home').then(r=>r.json()).then(d=>applyPhase(d.phase));}
+function confirmReset(){
+  if(confirm('Delete all calibration data and start over? This cannot be undone.'))
+    setupReset();
+}
 function setupReset(){verts=[];zClosed=false;fetch('/setup/reset').then(r=>r.json()).then(d=>applyPhase(d.phase));}
 function clearZone(){verts=[];zClosed=false;sendZone();updDrawBtns();}
 function closeZone(){if(verts.length<3)return;zClosed=true;sendZone();updDrawBtns();}
@@ -1159,7 +1191,6 @@ function savePointHere(){
     updStrength(d);
   });
 }
-function setupFinish(){fetch('/setup/finish');curPhase=null;applyPhase(null);}
 function setDepth(v){
   fetch('/setup/depth',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({depth_m:parseFloat(v)||null})});
@@ -1236,6 +1267,7 @@ function ptInZone(x, y){
 }
 
 sc.addEventListener('mousedown',e=>{
+  if(curPage !== 'setup') return;
   const r=sc.getBoundingClientRect();
   const x=Math.round(e.clientX-r.left),y=Math.round(e.clientY-r.top);
 
