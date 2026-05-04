@@ -456,11 +456,16 @@ app = FastAPI()
 
 @app.get("/stream")
 def stream():
-    """Proxy the MJPEG stream from rpicam-vid to the browser."""
     import socket
     def generate():
+        # Retry connecting to rpicam-vid for up to 10 seconds
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect(("127.0.0.1", 8888))
+        for _ in range(20):
+            try:
+                sock.connect(("127.0.0.1", 8888))
+                break
+            except ConnectionRefusedError:
+                time.sleep(0.5)
         while True:
             chunk = sock.recv(65536)
             if not chunk:
