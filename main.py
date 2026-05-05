@@ -596,7 +596,26 @@ def status():
                  "conf":round(d["conf"],2),"in_zone":d["in_zone"],
                  "is_primary":d["id"]==tracking["primary_target_id"]}
                 for d in latest_detections]
-    zone_px, z_closed = get_live_zone()
+    # Tracking debug — shows exactly what the formula is computing
+    track_debug = None
+    with detection_lock:
+        dets_snap = list(latest_detections)
+    in_zone_dets = [d for d in dets_snap if d["in_zone"]]
+    if in_zone_dets:
+        t = in_zone_dets[0]
+        err_pan  = round(((t["cx"] - reticle["x"]) / FRAME_W) * 66.0, 2)
+        err_tilt = round(((t["cy"] - reticle["y"]) / FRAME_H) * 41.0, 2)
+        track_debug = {
+            "cat_cx": t["cx"], "cat_cy": t["cy"],
+            "reticle_x": reticle["x"], "reticle_y": reticle["y"],
+            "err_pan_deg": err_pan, "err_tilt_deg": err_tilt,
+            "step_pan": round(max(-2.0, min(2.0, err_pan)), 2),
+            "step_tilt": round(max(-2.0, min(2.0, err_tilt)), 2),
+            "current_pan": round(servo_angles["pan"], 1),
+            "current_tilt": round(servo_angles["tilt"], 1),
+            "cmd_pan": round(servo_angles["pan"] + max(-2.0, min(2.0, err_pan)), 1),
+            "cmd_tilt": round(servo_angles["tilt"] + max(-2.0, min(2.0, err_tilt)), 1),
+        }
     setup_verts, setup_closed, is_exact = get_setup_zone()
     strength = compute_calibration_strength()
     gp = grid_snap(servo_angles["pan"])
@@ -620,6 +639,7 @@ def status():
         "strength":strength,
         "cam":cam_settings,"depth_m":zone_cal["depth_m"],
         "reticle_x":reticle["x"],"reticle_y":reticle["y"],
+        "track_debug": track_debug,
     }
 
 @app.post("/settings")
@@ -976,6 +996,7 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
     <button class="btn gr" onclick="fetch('/servos/home/go')">🏠 Home</button>
     <button class="btn gr" onclick="fetch('/servos/home/set')">📌 Set Home</button>
   </div>
+  <div id="track-dbg" style="font-family:monospace;font-size:0.78em;color:#8af;background:#111;padding:6px 10px;border-radius:4px;margin:4px 0;display:none;max-width:640px;line-height:1.7"></div>
   <div class="ctrl">
     <span style="color:#aaa;font-size:0.85em">Pan/Tilt:</span>
     <button class="btn gr" onclick="mv(0,-5)">▲</button>
@@ -1580,6 +1601,22 @@ setInterval(()=>{
     if(!reticleInited && d.reticle_x){
       reticleInited=true;
       localReticle={x:d.reticle_x,y:d.reticle_y};
+    }
+
+    // Tracking debug panel — visible on live page when cat in zone
+    const dbgEl = document.getElementById('track-dbg');
+    if(dbgEl){
+      if(d.track_debug){
+        const td = d.track_debug;
+        dbgEl.style.display='block';
+        dbgEl.innerHTML=
+          `cat:(${td.cat_cx},${td.cat_cy}) reticle:(${td.reticle_x},${td.reticle_y})<br>`+
+          `err_pan:${td.err_pan_deg}°  err_tilt:${td.err_tilt_deg}°<br>`+
+          `step:pan${td.step_pan>=0?'+':''}${td.step_pan}°  tilt${td.step_tilt>=0?'+':''}${td.step_tilt}°<br>`+
+          `pan:${td.current_pan}°→<b>${td.cmd_pan}°</b>  tilt:${td.current_tilt}°→<b>${td.cmd_tilt}°</b>`;
+      } else {
+        dbgEl.style.display='none';
+      }
     }
     if(d.cam&&!camInit){
       camInit=true;
