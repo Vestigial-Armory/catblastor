@@ -1132,6 +1132,10 @@ let zClosed   = false;
 let dragIdx   = -1;
 let dragOff   = {x:0,y:0};
 let tgtOn     = false;
+let targeting_active_local = false;
+let localReticle = {x: 320, y: 240};
+let reticleDrag  = false;
+let reticleInited = false;
 let curPhase  = null;
 let camInit   = false;
 
@@ -1211,7 +1215,6 @@ function applyPhase(phase){
       phase==='forced_down'?'✓ Done — Return to Home':'✓ Done';
   } else if(phase==='extra'){
     document.getElementById('ph-extra').style.display='block';
-    loadCalPoints();
   }
 }
 
@@ -1243,10 +1246,6 @@ function resetReticle(){
     localReticle={x:d.x,y:d.y};
   });
 }
-
-let reticleInited = false;
-let localReticle = {x: 320, y: 240};
-let reticleDrag = false;
 
 function toggleTgt(){
   targeting_active_local = !targeting_active_local;
