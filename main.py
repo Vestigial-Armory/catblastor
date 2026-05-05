@@ -433,8 +433,15 @@ def servo_tracking_loop():
             dets = list(latest_detections)
         t = select_target(dets)
         if t:
-            pan  = servo_angles["pan"]  - ((t["cx"]-reticle["x"])/FRAME_W)*66.0
-            tilt = servo_angles["tilt"] - ((t["cy"]-reticle["y"])/FRAME_H)*41.0
+            # Compute full angular correction needed
+            err_pan  = ((t["cx"] - reticle["x"]) / FRAME_W)  * 66.0
+            err_tilt = ((t["cy"] - reticle["y"]) / FRAME_H)  * 41.0
+            # Clamp step to 2° max per frame — prevents runaway when inference is slow
+            MAX_STEP = 2.0
+            step_pan  = max(-MAX_STEP, min(MAX_STEP, err_pan))
+            step_tilt = max(-MAX_STEP, min(MAX_STEP, err_tilt))
+            pan  = servo_angles["pan"]  - step_pan
+            tilt = servo_angles["tilt"] - step_tilt
             move_servos(pan, tilt)
         time.sleep(0.05)
 
