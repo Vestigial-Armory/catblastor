@@ -397,6 +397,10 @@ def inference_loop():
         pan_now  = servo_angles["pan"]
         tilt_now = servo_angles["tilt"]
         results = model(frame, verbose=False)
+        # Also snapshot previous target for direction verification
+        with world_target_lock:
+            prev_target_pan  = world_target["pan"]
+            prev_target_tilt = world_target["tilt"]
         sx, sy = FRAME_W/INFER_W, FRAME_H/INFER_H
         dets = []
         for r in results[0].boxes:
@@ -418,6 +422,12 @@ def inference_loop():
             if in_zone_dets:
                 t = in_zone_dets[0]
                 rx = state["reticle_x"]; ry = state["reticle_y"]
+                # Log how cat pixel moved vs how servo moved — tells us the sign empirically
+                if prev_target_pan is not None:
+                    dpan  = round(pan_now  - prev_target_pan,  1)
+                    dtilt = round(tilt_now - prev_target_tilt, 1)
+                    log(f"DIRECTION servo_delta=({dpan},{dtilt}) cat_pixel=({t['cx']},{t['cy']}) "
+                        f"[if servo moved RIGHT (+pan) and cat moved LEFT (-cx), signs are NORMAL]")
                 world_target["pan"]  = pan_now  - ((t["cx"] - rx) / FRAME_W) * 66.0
                 world_target["tilt"] = tilt_now - ((t["cy"] - ry) / FRAME_H) * 41.0
                 log(f"TARGET pan_now={pan_now:.1f} tilt_now={tilt_now:.1f} "
