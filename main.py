@@ -1431,14 +1431,13 @@ function drawOvs(d){
     // Reticle — always drawn, draggable during targeting
     const rx = (curPage==='setup' && targeting_active_local) ? localReticle.x : (d.reticle_x||FRAME_W/2);
     const ry = (curPage==='setup' && targeting_active_local) ? localReticle.y : (d.reticle_y||FRAME_H/2);
-    c.strokeStyle = '#ff4400';
-    c.lineWidth = 2;
-    c.beginPath(); c.arc(rx, ry, 18, 0, 2*Math.PI); c.stroke();
-    c.beginPath(); c.moveTo(rx-28,ry); c.lineTo(rx+28,ry); c.stroke();
-    c.beginPath(); c.moveTo(rx,ry-28); c.lineTo(rx,ry+28); c.stroke();
-    // Small center dot
-    c.fillStyle='#ff4400';
-    c.beginPath(); c.arc(rx,ry,3,0,2*Math.PI); c.fill();
+    ctx.strokeStyle = '#ff4400';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(rx, ry, 18, 0, 2*Math.PI); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(rx-28,ry); ctx.lineTo(rx+28,ry); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(rx,ry-28); ctx.lineTo(rx,ry+28); ctx.stroke();
+    ctx.fillStyle='#ff4400';
+    ctx.beginPath(); ctx.arc(rx,ry,3,0,2*Math.PI); ctx.fill();
     if(d.recording){
       ctx.fillStyle='#f00';ctx.beginPath();ctx.arc(20,20,8,0,2*Math.PI);ctx.fill();
       ctx.fillStyle='#f00';ctx.font='bold 12px sans-serif';ctx.fillText('REC',32,25);
