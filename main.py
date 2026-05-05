@@ -35,7 +35,11 @@ SETTINGS_FILE  = BASE_DIR / "settings.json"
 CAM_FILE       = BASE_DIR / "camera_settings.json"
 RECORDINGS_DIR.mkdir(exist_ok=True)
 
-LOG_FILE = BASE_DIR / "catblastor_events.log"
+RETICLE_FILE = BASE_DIR / "reticle.json"
+if RETICLE_FILE.exists():
+    saved_r = json.loads(RETICLE_FILE.read_text())
+    state["reticle_x"] = saved_r.get("x", FRAME_W//2)
+    state["reticle_y"] = saved_r.get("y", FRAME_H//2)
 _log_handler = logging.FileHandler(str(LOG_FILE))
 _log_handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 _logger = logging.getLogger("cb")
@@ -504,39 +508,89 @@ def servo_tracking_loop():
 
         move_servos(new_pan, new_tilt)
 
+def reticle_to_bbox_dist(rx, ry, det):
+    """Shortest distance from reticle pixel to cat bounding box edge. 0 if inside."""
+    x1,y1,x2,y2 = det["x1"],det["y1"],det["x2"],det["y2"]
+    dx = max(x1 - rx, 0, rx - x2)
+    dy = max(y1 - ry, 0, ry - y2)
+    return np.sqrt(dx*dx + dy*dy)
+
 def firing_loop():
+    pump_off_time     = 0.0  # when to turn pump off (set when zone goes clear)
+    solenoid_off_time = 0.0  # when solenoid linger expires
+    zone_clear_since  = 0.0  # when zone last became empty
+    zone_was_occupied = False
+
     while True:
         if not state["armed"] or state["setup_phase"] is not None:
-            # Don't touch GPIO if targeting calibration is active — targeting_loop owns the pins
             if not targeting_active:
-                GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
-            firing["active"] = False; time.sleep(0.1); continue
+                GPIO.output(PUMP_PIN,     GPIO.LOW)
+                GPIO.output(SOLENOID_PIN, GPIO.LOW)
+            firing["active"] = False
+            pump_off_time = solenoid_off_time = 0.0
+            zone_was_occupied = False
+            time.sleep(0.1); continue
+
         with detection_lock:
             dets = list(latest_detections)
-        t = select_target(dets); now = time.time()
-        if not t:
-            GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
-            firing["active"] = False; time.sleep(0.1); continue
+
+        now  = time.time()
+        in_zone_dets = [d for d in dets if d["in_zone"]]
+        t    = select_target(dets)
+
+        # ── Pump: on while cats in zone, off 2s after zone clear ─────────────
+        if in_zone_dets:
+            zone_was_occupied = True
+            zone_clear_since  = 0.0
+            pump_off_time     = now + 2.0
+            GPIO.output(PUMP_PIN, GPIO.HIGH)
+        elif zone_was_occupied:
+            if zone_clear_since == 0.0:
+                zone_clear_since = now
+            if now < pump_off_time:
+                GPIO.output(PUMP_PIN, GPIO.HIGH)  # linger
+            else:
+                GPIO.output(PUMP_PIN, GPIO.LOW)
+                zone_was_occupied = False
+        else:
+            GPIO.output(PUMP_PIN, GPIO.LOW)
+
+        # ── Solenoid: fire when reticle within 50px of cat bbox ───────────────
         rx = state["reticle_x"]; ry = state["reticle_y"]
-        dist = np.sqrt((t["cx"]-rx)**2+(t["cy"]-ry)**2)
-        if dist > state["on_target_tolerance"]:
-            time.sleep(0.05); continue
-        if state["firing_mode"] == "single":
-            if now - firing["last_fire_time"] >= state["reload_time"]:
-                _fire_burst(); firing["last_fire_time"] = time.time()
-        elif state["firing_mode"] == "semi_auto":
-            if now - firing["last_fire_time"] >= state["semi_auto_delay"]:
-                _fire_burst(); firing["last_fire_time"] = time.time()
+        on_target = False
+        if t:
+            on_target = reticle_to_bbox_dist(rx, ry, t) <= 50
+
+        # Extend solenoid linger while cat is in zone and on target
+        in_zone_any = bool(in_zone_dets)
+        if in_zone_any and on_target:
+            solenoid_off_time = now + 2.0
+
+        solenoid_active = now < solenoid_off_time
+
+        if solenoid_active:
+            if state["firing_mode"] == "single":
+                if now - firing["last_fire_time"] >= state["reload_time"]:
+                    threading.Thread(target=_fire_burst, daemon=True).start()
+                    firing["last_fire_time"] = now
+            elif state["firing_mode"] == "semi_auto":
+                if now - firing["last_fire_time"] >= state["semi_auto_delay"]:
+                    threading.Thread(target=_fire_burst, daemon=True).start()
+                    firing["last_fire_time"] = now
+        else:
+            if not firing["active"]:
+                GPIO.output(SOLENOID_PIN, GPIO.LOW)
+
+        firing["active"] = solenoid_active and bool(in_zone_dets)
         time.sleep(0.05)
 
+
 def _fire_burst():
-    firing["active"] = True
     log(f"FIRE pan={servo_angles['pan']:.1f} tilt={servo_angles['tilt']:.1f} burst={state['burst_length']}s")
-    GPIO.output(PUMP_PIN,GPIO.HIGH); GPIO.output(SOLENOID_PIN,GPIO.HIGH)
+    GPIO.output(SOLENOID_PIN, GPIO.HIGH)
     time.sleep(state["burst_length"])
-    GPIO.output(SOLENOID_PIN,GPIO.LOW); GPIO.output(PUMP_PIN,GPIO.LOW)
+    GPIO.output(SOLENOID_PIN, GPIO.LOW)
     log("FIRE_END")
-    firing["active"] = False
 
 def targeting_loop():
     while True:
@@ -938,6 +992,7 @@ async def set_reticle(request: Request):
     data = await request.json()
     state["reticle_x"] = int(data.get("x", FRAME_W//2))
     state["reticle_y"] = int(data.get("y", FRAME_H//2))
+    RETICLE_FILE.write_text(json.dumps({"x":state["reticle_x"],"y":state["reticle_y"]}))
     return {"reticle_x":state["reticle_x"],"reticle_y":state["reticle_y"]}
 
 @app.get("/log")
