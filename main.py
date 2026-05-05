@@ -359,8 +359,6 @@ detection_lock    = threading.Lock()
 
 # ─── Tracking & Firing ───────────────────────────────────────────────────────
 tracking = {"primary_target_id":None,"target_entry_times":{},"last_seen":{}}
-world_target = {"pan":None,"tilt":None}  # absolute angle where cat is in world space
-world_target_lock = threading.Lock()
 firing   = {"active":False,"last_fire_time":0}
 targeting_active = False
 
@@ -394,8 +392,6 @@ def inference_loop():
             if latest_frame is None: time.sleep(0.05); continue
             frame = latest_frame.copy()
         # Snapshot servo angles at the exact moment inference ran
-        pan_now  = servo_angles["pan"]
-        tilt_now = servo_angles["tilt"]
         results = model(frame, verbose=False)
         sx, sy = FRAME_W/INFER_W, FRAME_H/INFER_H
         dets = []
@@ -411,21 +407,6 @@ def inference_loop():
             prev_in_zone = {d["id"] for d in latest_detections if d["in_zone"]}
             prev_ids     = {d["id"] for d in latest_detections}
             latest_detections = dets
-
-        # Compute world target from primary in-zone cat at inference-time servo angles
-        in_zone_dets = [d for d in dets if d["in_zone"]]
-        with world_target_lock:
-            if in_zone_dets:
-                t = in_zone_dets[0]
-                rx = state["reticle_x"]; ry = state["reticle_y"]
-                world_target["pan"]  = pan_now  - ((t["cx"] - rx) / FRAME_W) * 66.0
-                world_target["tilt"] = tilt_now - ((t["cy"] - ry) / FRAME_H) * 41.0
-                log(f"TARGET pan_now={pan_now:.1f} tilt_now={tilt_now:.1f} "
-                    f"cx={t['cx']} cy={t['cy']} rx={rx} ry={ry} "
-                    f"→ target_pan={world_target['pan']:.1f} target_tilt={world_target['tilt']:.1f}")
-            else:
-                world_target["pan"]  = None
-                world_target["tilt"] = None
         new_ids     = {d["id"] for d in dets}
         new_in_zone = {d["id"] for d in dets if d["in_zone"]}
         for d in dets:
@@ -470,44 +451,49 @@ def servo_tracking_loop():
         if not state["armed"] or state["setup_phase"] is not None:
             time.sleep(0.05); continue
 
-        with world_target_lock:
-            target_pan  = world_target["pan"]
-            target_tilt = world_target["tilt"]
-
-        if target_pan is None or target_tilt is None:
+        with detection_lock:
+            dets = list(latest_detections)
+        t = select_target(dets)
+        if not t:
             time.sleep(0.05); continue
 
-        cur_pan  = servo_angles["pan"]
-        cur_tilt = servo_angles["tilt"]
-        err_pan  = target_pan  - cur_pan
-        err_tilt = target_tilt - cur_tilt
+        rx = state["reticle_x"]
+        ry = state["reticle_y"]
+        err_x = t["cx"] - rx  # pixels: positive = cat is right of reticle
+        err_y = t["cy"] - ry  # pixels: positive = cat is below reticle
 
-        # If already within 0.5° on both axes, no movement needed
-        if abs(err_pan) < 0.5 and abs(err_tilt) < 0.5:
+        # Dead zone: within 10px on both axes, no movement needed
+        if abs(err_x) < 10 and abs(err_y) < 10:
             time.sleep(0.05); continue
 
-        MAX_STEP = 2.0
-        step_pan  = max(-MAX_STEP, min(MAX_STEP, err_pan))
-        step_tilt = max(-MAX_STEP, min(MAX_STEP, err_tilt))
-        new_pan  = cur_pan  + step_pan
-        new_tilt = cur_tilt + step_tilt
+        # Increasing pan moves scene right (cat moves right)
+        # So if cat is right of reticle (err_x > 0): increase pan to move cat right? No —
+        # we want cat to move LEFT toward reticle: decrease pan
+        # Confirmed from log: increasing pan = camera pans left = scene shifts right
+        # cat right of reticle → need cat to move left → pan left (increase pan)
+        # Wait — scene shifts right means cat moves right (further from reticle). Wrong.
+        # Confirmed correct: increasing pan moves scene RIGHT, cat moves RIGHT.
+        # cat RIGHT of reticle → need cat to move LEFT → scene shifts LEFT → decrease pan
+        STEP = 1.5  # degrees per frame
+        step_pan  = -np.sign(err_x) * min(STEP, abs(err_x) / 50 * STEP * 3)
+        step_tilt = -np.sign(err_y) * min(STEP, abs(err_y) / 50 * STEP * 3)
 
-        # Clamp to 80% pan / full 60-120° tilt range from home
+        new_pan  = servo_angles["pan"]  + step_pan
+        new_tilt = servo_angles["tilt"] + step_tilt
+
         pan_lim  = PAN_RANGE  * 0.8
-        tilt_lim = 30.0  # allows 60° to 120° from home at 90°
         new_pan  = clamp(new_pan,
                          max(PAN_MIN,  home_position["pan"]  - pan_lim),
                          min(PAN_MAX,  home_position["pan"]  + pan_lim))
-        new_tilt = clamp(new_tilt,
-                         max(60.0, home_position["tilt"] - tilt_lim),
-                         min(120.0, home_position["tilt"] + tilt_lim))
+        new_tilt = clamp(new_tilt, 60.0, 120.0)
 
         now = time.time()
         if now - _last_log >= 0.5:
             _last_log = now
-            log(f"TRACK err=({err_pan:.1f},{err_tilt:.1f}) "
-                f"step=({step_pan:.1f},{step_tilt:.1f}) "
-                f"pan:{cur_pan:.1f}->{new_pan:.1f} tilt:{cur_tilt:.1f}->{new_tilt:.1f}")
+            log(f"TRACK cat=({t['cx']},{t['cy']}) reticle=({rx},{ry}) "
+                f"err_px=({err_x},{err_y}) "
+                f"pan:{servo_angles['pan']:.1f}->{new_pan:.1f} "
+                f"tilt:{servo_angles['tilt']:.1f}->{new_tilt:.1f}")
 
         move_servos(new_pan, new_tilt)
         time.sleep(0.05)
@@ -525,9 +511,9 @@ def firing_loop():
         if not t:
             GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
             firing["active"] = False; time.sleep(0.1); continue
-        dist = np.sqrt((servo_angles["pan"]  - (world_target["pan"]  or 9999))**2 +
-                       (servo_angles["tilt"] - (world_target["tilt"] or 9999))**2)
-        if dist > 2.0:  # within 2° = on target
+        rx = state["reticle_x"]; ry = state["reticle_y"]
+        dist = np.sqrt((t["cx"]-rx)**2+(t["cy"]-ry)**2)
+        if dist > state["on_target_tolerance"]:
             time.sleep(0.05); continue
         if state["firing_mode"] == "single":
             if now - firing["last_fire_time"] >= state["reload_time"]:
