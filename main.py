@@ -36,10 +36,6 @@ CAM_FILE       = BASE_DIR / "camera_settings.json"
 RECORDINGS_DIR.mkdir(exist_ok=True)
 
 RETICLE_FILE = BASE_DIR / "reticle.json"
-if RETICLE_FILE.exists():
-    saved_r = json.loads(RETICLE_FILE.read_text())
-    state["reticle_x"] = saved_r.get("x", FRAME_W//2)
-    state["reticle_y"] = saved_r.get("y", FRAME_H//2)
 _log_handler = logging.FileHandler(str(LOG_FILE))
 _log_handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 _logger = logging.getLogger("cb")
@@ -244,7 +240,14 @@ def save_settings():
         ["firing_mode","burst_length","reload_time","semi_auto_delay",
          "confidence_threshold","on_target_tolerance"]}))
 
-# ─── Servo State ─────────────────────────────────────────────────────────────
+# Load persisted reticle position
+if RETICLE_FILE.exists():
+    try:
+        saved_r = json.loads(RETICLE_FILE.read_text())
+        state["reticle_x"] = saved_r.get("x", FRAME_W//2)
+        state["reticle_y"] = saved_r.get("y", FRAME_H//2)
+    except Exception:
+        pass
 servo_angles = {"pan":90.0,"tilt":90.0}
 home_position = {"pan":90.0,"tilt":90.0}
 if HOME_FILE.exists():
