@@ -221,7 +221,7 @@ kit.servo[PAN_CH].angle  = 90
 kit.servo[TILT_CH].angle = 90
 
 # ─── YOLO ────────────────────────────────────────────────────────────────────
-model = YOLO("yolov8n.pt")
+model = YOLO("yolov8n_ncnn_model")
 
 # ─── App State ───────────────────────────────────────────────────────────────
 state = {
@@ -476,7 +476,7 @@ def servo_tracking_loop():
                 _last_inf_time = time.time()
 
         # Stop if no fresh inference in 500ms
-        if time.time() - _last_inf_time > 0.5:
+        if time.time() - _last_inf_time > 0.7:
             time.sleep(0.05); continue
 
         t = select_target(dets)
@@ -559,7 +559,7 @@ def firing_loop():
 
         # ── Solenoid: all four conditions must be true simultaneously ──────────
         rx = state["reticle_x"]; ry = state["reticle_y"]
-        on_target = t is not None and reticle_to_bbox_dist(rx, ry, t) <= 50
+        on_target = t is not None and bool(reticle_to_bbox_dist(rx, ry, t) <= 50)
 
         solenoid_allowed = (
             any_detected and       # cat detected anywhere in frame
