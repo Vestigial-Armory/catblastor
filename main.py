@@ -435,7 +435,9 @@ def servo_tracking_loop():
 def firing_loop():
     while True:
         if not state["armed"] or state["setup_phase"] is not None:
-            GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
+            # Don't touch GPIO if targeting calibration is active — targeting_loop owns the pins
+            if not targeting_active:
+                GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
             firing["active"] = False; time.sleep(0.1); continue
         with detection_lock:
             dets = list(latest_detections)
