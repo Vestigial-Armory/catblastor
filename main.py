@@ -226,20 +226,21 @@ model = YOLO("yolov8n.pt")
 # ─── App State ───────────────────────────────────────────────────────────────
 state = {
     "armed":False,"firing_mode":"single","burst_length":1.0,
-    "reload_time":10.0,"semi_auto_delay":2.0,"confidence_threshold":0.5,
+    "reload_time":10.0,"semi_auto_delay":2.0,"confidence_threshold":0.35,
     "on_target_tolerance":20,"setup_phase":None,
     "reticle_x":FRAME_W//2,"reticle_y":FRAME_H//2,
+    "target_class":15,
 }
 if SETTINGS_FILE.exists():
     saved = json.loads(SETTINGS_FILE.read_text())
     for k in ["firing_mode","burst_length","reload_time","semi_auto_delay",
-               "confidence_threshold","on_target_tolerance"]:
+               "confidence_threshold","on_target_tolerance","target_class"]:
         if k in saved: state[k] = saved[k]
 
 def save_settings():
     SETTINGS_FILE.write_text(json.dumps({k:state[k] for k in
         ["firing_mode","burst_length","reload_time","semi_auto_delay",
-         "confidence_threshold","on_target_tolerance"]}))
+         "confidence_threshold","on_target_tolerance","target_class"]}))
 
 # Load persisted reticle position
 if RETICLE_FILE.exists():
@@ -406,7 +407,7 @@ def inference_loop():
         dets = []
         for r in results[0].boxes:
             cls = int(r.cls); conf = float(r.conf)
-            if cls == CAT_CLASS and conf >= state["confidence_threshold"]:
+            if cls == state["target_class"] and conf >= state["confidence_threshold"]:
                 x1,y1,x2,y2 = map(int, r.xyxy[0])
                 x1,y1,x2,y2 = int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy)
                 cx,cy = (x1+x2)//2,(y1+y2)//2
@@ -456,44 +457,41 @@ def select_target(detections):
     return t
 
 def servo_tracking_loop():
-    _last_log = 0.0
-    _last_seq  = -1
+    _last_log      = 0.0
+    _last_inf_time = 0.0
+    _prev_seq      = -1
+
     while True:
         if not state["armed"] or state["setup_phase"] is not None:
             time.sleep(0.05); continue
 
         with detection_lock:
             cur_seq = inference_seq
-            dets = list(latest_detections)
+            dets    = list(latest_detections)
 
-        # Only move once per new inference result
-        if cur_seq == _last_seq:
-            time.sleep(0.02); continue
-        _last_seq = cur_seq
+        # Update freshness whenever inference produces a new result
+        if cur_seq != _prev_seq:
+            _prev_seq = cur_seq
+            if dets:
+                _last_inf_time = time.time()
+
+        # Stop if no fresh inference in 500ms
+        if time.time() - _last_inf_time > 0.5:
+            time.sleep(0.05); continue
 
         t = select_target(dets)
         if not t:
-            continue
+            time.sleep(0.05); continue
 
-        rx = state["reticle_x"]
-        ry = state["reticle_y"]
-        err_x = t["cx"] - rx  # positive = cat right of reticle
-        err_y = t["cy"] - ry  # positive = cat below reticle
+        rx    = state["reticle_x"]
+        ry    = state["reticle_y"]
+        err_x = t["cx"] - rx
+        err_y = t["cy"] - ry
 
         if abs(err_x) < 10 and abs(err_y) < 10:
-            continue
+            time.sleep(0.05); continue
 
-        # Pan: increasing pan moves scene right → cat moves right
-        # cat right of reticle (err_x>0) → need cat to move left → decrease pan
-        # cat left of reticle (err_x<0) → need cat to move right → increase pan
-        # So: step_pan = -sign(err_x)
-        #
-        # Tilt: increasing tilt moves scene up → cat moves up
-        # cat below reticle (err_y>0) → need cat to move up → increase tilt
-        # cat above reticle (err_y<0) → need cat to move down → decrease tilt
-        # So: step_tilt = +sign(err_y)
-
-        MAX_STEP = 3.0
+        MAX_STEP  = 3.0
         step_pan  = -np.sign(err_x) * min(MAX_STEP, abs(err_x) / 40.0 * MAX_STEP)
         step_tilt =  np.sign(err_y) * min(MAX_STEP, abs(err_y) / 40.0 * MAX_STEP)
 
@@ -503,7 +501,7 @@ def servo_tracking_loop():
         new_tilt = clamp(servo_angles["tilt"] + step_tilt, 60.0, 120.0)
 
         now = time.time()
-        if now - _last_log >= 0.3:
+        if now - _last_log >= 0.5:
             _last_log = now
             log(f"TRACK cat=({t['cx']},{t['cy']}) reticle=({rx},{ry}) "
                 f"err_px=({err_x},{err_y}) "
@@ -511,6 +509,7 @@ def servo_tracking_loop():
                 f"tilt:{servo_angles['tilt']:.1f}->{new_tilt:.1f}")
 
         move_servos(new_pan, new_tilt)
+        time.sleep(0.05)
 
 def reticle_to_bbox_dist(rx, ry, det):
     """Shortest distance from reticle pixel to cat bounding box edge. 0 if inside."""
@@ -520,10 +519,8 @@ def reticle_to_bbox_dist(rx, ry, det):
     return np.sqrt(dx*dx + dy*dy)
 
 def firing_loop():
-    pump_off_time     = 0.0  # when to turn pump off (set when zone goes clear)
-    solenoid_off_time = 0.0  # when solenoid linger expires
-    zone_clear_since  = 0.0  # when zone last became empty
-    zone_was_occupied = False
+    last_in_zone_time = 0.0   # last time a cat was seen in zone
+    zone_was_occupied = False  # for pump linger tracking
 
     while True:
         if not state["armed"] or state["setup_phase"] is not None:
@@ -531,48 +528,46 @@ def firing_loop():
                 GPIO.output(PUMP_PIN,     GPIO.LOW)
                 GPIO.output(SOLENOID_PIN, GPIO.LOW)
             firing["active"] = False
-            pump_off_time = solenoid_off_time = 0.0
+            last_in_zone_time = 0.0
             zone_was_occupied = False
             time.sleep(0.1); continue
 
         with detection_lock:
             dets = list(latest_detections)
 
-        now  = time.time()
+        now          = time.time()
         in_zone_dets = [d for d in dets if d["in_zone"]]
-        t    = select_target(dets)
+        any_detected = bool(dets)
+        t            = select_target(dets)
 
-        # ── Pump: on while cats in zone, off 2s after zone clear ─────────────
+        # Track last time cat was in zone
         if in_zone_dets:
+            last_in_zone_time = now
             zone_was_occupied = True
-            zone_clear_since  = 0.0
-            pump_off_time     = now + 2.0
+
+        zone_within_2s = (now - last_in_zone_time) < 2.0
+
+        # ── Pump: on while cats in zone, off 2s after zone clear ──────────────
+        if in_zone_dets:
             GPIO.output(PUMP_PIN, GPIO.HIGH)
-        elif zone_was_occupied:
-            if zone_clear_since == 0.0:
-                zone_clear_since = now
-            if now < pump_off_time:
-                GPIO.output(PUMP_PIN, GPIO.HIGH)  # linger
-            else:
-                GPIO.output(PUMP_PIN, GPIO.LOW)
-                zone_was_occupied = False
+        elif zone_was_occupied and zone_within_2s:
+            GPIO.output(PUMP_PIN, GPIO.HIGH)  # linger
         else:
             GPIO.output(PUMP_PIN, GPIO.LOW)
+            if not zone_within_2s:
+                zone_was_occupied = False
 
-        # ── Solenoid: fire when reticle within 50px of cat bbox ───────────────
+        # ── Solenoid: all four conditions must be true simultaneously ──────────
         rx = state["reticle_x"]; ry = state["reticle_y"]
-        on_target = False
-        if t:
-            on_target = reticle_to_bbox_dist(rx, ry, t) <= 50
+        on_target = t is not None and reticle_to_bbox_dist(rx, ry, t) <= 50
 
-        # Extend solenoid linger while cat is in zone and on target
-        in_zone_any = bool(in_zone_dets)
-        if in_zone_any and on_target:
-            solenoid_off_time = now + 2.0
+        solenoid_allowed = (
+            any_detected and       # cat detected anywhere in frame
+            zone_within_2s and     # cat in zone within last 2 seconds
+            on_target              # reticle within 50px of cat bbox
+        )
 
-        solenoid_active = now < solenoid_off_time
-
-        if solenoid_active:
+        if solenoid_allowed:
             if state["firing_mode"] == "single":
                 if now - firing["last_fire_time"] >= state["reload_time"]:
                     threading.Thread(target=_fire_burst, daemon=True).start()
@@ -585,7 +580,7 @@ def firing_loop():
             if not firing["active"]:
                 GPIO.output(SOLENOID_PIN, GPIO.LOW)
 
-        firing["active"] = solenoid_active and bool(in_zone_dets)
+        firing["active"] = solenoid_allowed
         time.sleep(0.05)
 
 
@@ -729,13 +724,15 @@ def status():
         "strength":strength,
         "cam":cam_settings,"depth_m":zone_cal["depth_m"],
         "reticle_x":state["reticle_x"],"reticle_y":state["reticle_y"],
+        "target_class":state["target_class"],
+        "confidence_threshold":state["confidence_threshold"],
     }
 
 @app.post("/settings")
 async def update_settings(request: Request):
     data = await request.json()
     for k in ["firing_mode","burst_length","reload_time","semi_auto_delay",
-               "confidence_threshold","on_target_tolerance"]:
+               "confidence_threshold","on_target_tolerance","target_class"]:
         if k in data: state[k] = data[k]
     save_settings(); return {"status":"updated"}
 
@@ -1192,8 +1189,14 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
             <option value="single">Single Fire</option>
             <option value="semi_auto">Semi-Auto</option>
           </select></div>
-        <div class="set"><label>Confidence: <span class="vl" id="vl-c">0.5</span></label>
-          <input type="range" min="0.1" max="1" step="0.05" value="0.5" id="confidence_threshold"
+        <div class="set"><label>Target Class</label>
+          <input type="text" id="class-search" placeholder="Search class..." style="width:140px;margin-right:6px"
+                 oninput="filterClasses(this.value)">
+          <select id="target_class" size="1" onchange="updSettings()" style="width:160px"></select>
+          <span id="class-name" style="color:#aaa;font-size:0.85em;margin-left:6px"></span>
+        </div>
+        <div class="set"><label>Confidence: <span class="vl" id="vl-c">0.35</span></label>
+          <input type="range" min="0.1" max="1" step="0.05" value="0.35" id="confidence_threshold"
                  oninput="document.getElementById('vl-c').textContent=this.value" onchange="updSettings()"></div>
         <div class="set"><label>Burst (s): <span class="vl" id="vl-b">1.0</span></label>
           <input type="range" min="0.1" max="5" step="0.1" value="1" id="burst_length"
@@ -1601,7 +1604,49 @@ function drawArrow(ctx,cx,cy,w,h){
   ctx.fillText('Zone →',Math.max(5,ex-20),Math.max(15,ey-10));
 }
 
-// ── Settings ───────────────────────────────────────────────────────────────
+// ── COCO Classes ─────────────────────────────────────────────────────────────
+const COCO_CLASSES = [
+  [0,'person'],[1,'bicycle'],[2,'car'],[3,'motorcycle'],[4,'airplane'],
+  [5,'bus'],[6,'train'],[7,'truck'],[8,'boat'],[9,'traffic light'],
+  [10,'fire hydrant'],[11,'stop sign'],[12,'parking meter'],[13,'bench'],
+  [14,'bird'],[15,'cat'],[16,'dog'],[17,'horse'],[18,'sheep'],[19,'cow'],
+  [20,'elephant'],[21,'bear'],[22,'zebra'],[23,'giraffe'],[24,'backpack'],
+  [25,'umbrella'],[26,'handbag'],[27,'tie'],[28,'suitcase'],[29,'frisbee'],
+  [30,'skis'],[31,'snowboard'],[32,'sports ball'],[33,'kite'],[34,'baseball bat'],
+  [35,'baseball glove'],[36,'skateboard'],[37,'surfboard'],[38,'tennis racket'],
+  [39,'bottle'],[40,'wine glass'],[41,'cup'],[42,'fork'],[43,'knife'],
+  [44,'spoon'],[45,'bowl'],[46,'banana'],[47,'apple'],[48,'sandwich'],
+  [49,'orange'],[50,'broccoli'],[51,'carrot'],[52,'hot dog'],[53,'pizza'],
+  [54,'donut'],[55,'cake'],[56,'chair'],[57,'couch'],[58,'potted plant'],
+  [59,'bed'],[60,'dining table'],[61,'toilet'],[62,'tv'],[63,'laptop'],
+  [64,'mouse'],[65,'remote'],[66,'keyboard'],[67,'cell phone'],[68,'microwave'],
+  [69,'oven'],[70,'toaster'],[71,'sink'],[72,'refrigerator'],[73,'book'],
+  [74,'clock'],[75,'vase'],[76,'scissors'],[77,'teddy bear'],[78,'hair drier'],
+  [79,'toothbrush']
+];
+
+let _classSelInited = false;
+function filterClasses(q){
+  const sel = document.getElementById('target_class');
+  if(!sel) return;
+  const cur = parseInt(sel.value)||15;
+  sel.innerHTML='';
+  COCO_CLASSES.filter(([id,name])=>!q||name.includes(q.toLowerCase())).forEach(([id,name])=>{
+    const o=document.createElement('option');
+    o.value=id; o.textContent=`${id}: ${name}`;
+    if(id===cur) o.selected=true;
+    sel.appendChild(o);
+  });
+}
+function initClassSelector(currentClass){
+  if(_classSelInited) return;
+  _classSelInited=true;
+  filterClasses('');
+  const sel=document.getElementById('target_class');
+  if(sel){ sel.value=currentClass; }
+}
+
+// ── Settings ─────────────────────────────────────────────────────────────────
 function updSettings(){
   fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({
@@ -1611,6 +1656,7 @@ function updSettings(){
       semi_auto_delay:parseFloat(document.getElementById('semi_auto_delay').value),
       confidence_threshold:parseFloat(document.getElementById('confidence_threshold').value),
       on_target_tolerance:parseInt(document.getElementById('on_target_tolerance').value),
+      target_class:parseInt(document.getElementById('target_class').value)||15,
     })});
 }
 
@@ -1683,6 +1729,10 @@ setInterval(()=>{
     // Camera settings init
     if(d.cam&&!camInit){
       camInit=true;
+      initClassSelector(d.target_class||15);
+      const confEl=document.getElementById('confidence_threshold');
+      const confVl=document.getElementById('vl-c');
+      if(confEl&&d.confidence_threshold){confEl.value=d.confidence_threshold;if(confVl)confVl.textContent=d.confidence_threshold;}
       ['brightness','contrast','saturation','sharpness','ev','awb_gain_r','awb_gain_b'].forEach(k=>{
         const s=document.getElementById('cam-'+k);
         const n=document.getElementById('num-'+k);
