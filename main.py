@@ -619,7 +619,8 @@ def recording_loop():
             "ffmpeg", "-y",
             "-f", "mjpeg",
             "-i", "pipe:0",
-            "-c:v", "copy",
+            "-c:v", "h264_v4l2m2m",
+            "-b:v", "2000k",
             "-movflags", "+faststart",
             str(fn)
         ]
