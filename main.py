@@ -608,32 +608,63 @@ def targeting_loop():
             time.sleep(0.1)
 
 def recording_loop():
+    """Records directly from MJPEG stream via ffmpeg — true 30fps, faststart for browser playback."""
+    rec_proc = None
+
+    def start_recording():
+        ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fn  = RECORDINGS_DIR / f"catblastor_{ts}.mp4"
+        recording["filename"] = str(fn)
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "mjpeg",
+            "-i", "pipe:0",
+            "-c:v", "copy",
+            "-movflags", "+faststart",
+            str(fn)
+        ]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        recording["active"] = True
+        log(f"REC_START {fn.name}")
+        return proc
+
+    def stop_recording(proc):
+        if proc and proc.poll() is None:
+            try: proc.stdin.close()
+            except Exception: pass
+            proc.wait(timeout=5)
+        recording["active"] = False
+        recording["filename"] = None
+        log("REC_STOP")
+
     while True:
         with detection_lock:
             cats = len(latest_detections) > 0
         now = time.time()
+
         if cats:
             recording["last_detection_time"] = now
             if not recording["active"]:
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                fn = RECORDINGS_DIR / f"catblastor_{ts}.mp4"
-                recording["filename"] = str(fn)
-                recording["writer"] = cv2.VideoWriter(str(fn),
-                    cv2.VideoWriter_fourcc(*"mp4v"), 15, (FRAME_W,FRAME_H))
-                recording["active"] = True
+                rec_proc = start_recording()
+
         if recording["active"]:
+            # Feed latest MJPEG frame to ffmpeg stdin
             with mjpeg_lock:
-                fd = mjpeg_buffer
-            if fd:
+                frame_bytes = mjpeg_buffer
+            if frame_bytes and rec_proc and rec_proc.poll() is None:
                 try:
-                    arr = np.frombuffer(fd, dtype=np.uint8)
-                    f   = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                    if f is not None: recording["writer"].write(f)
-                except Exception: pass
-            if not cats and (now-recording["last_detection_time"]) > 10:
-                recording["writer"].release()
-                recording["writer"] = None; recording["active"] = False
-        time.sleep(1/15)
+                    rec_proc.stdin.write(frame_bytes)
+                    rec_proc.stdin.flush()
+                except Exception:
+                    pass
+
+            # Stop 10s after last detection
+            if not cats and (now - recording["last_detection_time"]) > 10:
+                stop_recording(rec_proc)
+                rec_proc = None
+
+        time.sleep(1/30)
 
 _last_cat_seen = time.time()
 
@@ -985,7 +1016,7 @@ async def rename_recording(filename: str, request: Request):
         return {"status":"renamed","name":new_name}
     return {"status":"error"}
 
-@app.get("/recordings/{filename}")
+@app.api_route("/recordings/{filename}", methods=["GET","HEAD"])
 def get_recording(filename: str):
     path = RECORDINGS_DIR / filename
     if path.exists(): return FileResponse(str(path), media_type="video/mp4")
