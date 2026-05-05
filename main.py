@@ -227,6 +227,7 @@ state = {
     "armed":False,"firing_mode":"single","burst_length":1.0,
     "reload_time":10.0,"semi_auto_delay":2.0,"confidence_threshold":0.5,
     "on_target_tolerance":20,"setup_phase":None,
+    "reticle_x":FRAME_W//2,"reticle_y":FRAME_H//2,
 }
 if SETTINGS_FILE.exists():
     saved = json.loads(SETTINGS_FILE.read_text())
@@ -452,15 +453,33 @@ def servo_tracking_loop():
             dets = list(latest_detections)
         t = select_target(dets)
         if t:
-            pan  = servo_angles["pan"]  + ((t["cx"]-FRAME_W/2)/FRAME_W)*66.0
-            tilt = servo_angles["tilt"] + ((t["cy"]-FRAME_H/2)/FRAME_H)*41.0
+            rx = state.get("reticle_x", FRAME_W // 2)
+            ry = state.get("reticle_y", FRAME_H // 2)
+            err_pan  = ((t["cx"] - rx) / FRAME_W) * 66.0
+            err_tilt = ((t["cy"] - ry) / FRAME_H) * 41.0
+            # Clamp to 2° per frame — prevents runaway when inference lags
+            MAX_STEP = 2.0
+            step_pan  = max(-MAX_STEP, min(MAX_STEP, err_pan))
+            step_tilt = max(-MAX_STEP, min(MAX_STEP, err_tilt))
+            new_pan  = servo_angles["pan"]  - step_pan
+            new_tilt = servo_angles["tilt"] - step_tilt
+            # Clamp to 80% pan / 40% tilt range from home
+            pan_lim  = PAN_RANGE  * 0.8
+            tilt_lim = TILT_RANGE * 0.4
+            new_pan  = clamp(new_pan,
+                             max(PAN_MIN,  home_position["pan"]  - pan_lim),
+                             min(PAN_MAX,  home_position["pan"]  + pan_lim))
+            new_tilt = clamp(new_tilt,
+                             max(TILT_MIN, home_position["tilt"] - tilt_lim),
+                             min(TILT_MAX, home_position["tilt"] + tilt_lim))
             now = time.time()
             if now - _last_log >= 0.5:
                 _last_log = now
-                log(f"TRACK cx={t['cx']} cy={t['cy']} "
-                    f"err_pan={((t['cx']-FRAME_W/2)/FRAME_W*66):.1f} err_tilt={((t['cy']-FRAME_H/2)/FRAME_H*41):.1f} "
-                    f"pan:{servo_angles['pan']:.1f}->{pan:.1f} tilt:{servo_angles['tilt']:.1f}->{tilt:.1f}")
-            move_servos(pan, tilt)
+                log(f"TRACK cx={t['cx']} cy={t['cy']} reticle=({rx},{ry}) "
+                    f"err=({err_pan:.1f},{err_tilt:.1f}) "
+                    f"pan:{servo_angles['pan']:.1f}->{new_pan:.1f} "
+                    f"tilt:{servo_angles['tilt']:.1f}->{new_tilt:.1f}")
+            move_servos(new_pan, new_tilt)
         time.sleep(0.05)
 
 def firing_loop():
@@ -535,15 +554,25 @@ def recording_loop():
                 recording["writer"] = None; recording["active"] = False
         time.sleep(1/15)
 
+_last_cat_seen = time.time()
+
 def home_position_loop():
+    global _last_cat_seen
     while True:
-        time.sleep(5)
-        if not state["armed"] or state["setup_phase"] is not None: continue
+        time.sleep(0.5)
+        if not state["armed"] or state["setup_phase"] is not None:
+            continue
         with detection_lock:
             cats = len(latest_detections)
-        if cats == 0 and not firing["active"]:
-            if time.time() - last_activity_time > HOME_TIMEOUT:
-                move_servos(home_position["pan"], home_position["tilt"])
+        if cats > 0:
+            _last_cat_seen = time.time()
+            continue
+        away = (abs(servo_angles["pan"]  - home_position["pan"])  > 1.0 or
+                abs(servo_angles["tilt"] - home_position["tilt"]) > 1.0)
+        if away and (time.time() - _last_cat_seen) > 5.0:
+            log(f"HOME pan={servo_angles['pan']:.1f}->{home_position['pan']:.1f} "
+                f"tilt={servo_angles['tilt']:.1f}->{home_position['tilt']:.1f}")
+            move_servos(home_position["pan"], home_position["tilt"], slow=True)
 
 # ─── Start Threads ───────────────────────────────────────────────────────────
 threading.Thread(target=start_streaming,     daemon=True).start()
@@ -616,6 +645,7 @@ def status():
         "n_total_positions":n_total,
         "strength":strength,
         "cam":cam_settings,"depth_m":zone_cal["depth_m"],
+        "reticle_x":state["reticle_x"],"reticle_y":state["reticle_y"],
     }
 
 @app.post("/settings")
@@ -877,6 +907,13 @@ def get_recording(filename: str):
     path = RECORDINGS_DIR / filename
     if path.exists(): return FileResponse(str(path), media_type="video/mp4")
     return {"error":"not found"}
+
+@app.post("/reticle")
+async def set_reticle(request: Request):
+    data = await request.json()
+    state["reticle_x"] = int(data.get("x", FRAME_W//2))
+    state["reticle_y"] = int(data.get("y", FRAME_H//2))
+    return {"reticle_x":state["reticle_x"],"reticle_y":state["reticle_y"]}
 
 @app.get("/log")
 def get_log():
@@ -1421,6 +1458,13 @@ function drawOvs(d){
       ctx.fillText('CAT'+(det.is_primary?' [TGT]':'')+' '+det.conf,det.x1,det.y1-4);
     });
 
+    // Reticle
+    const rx = d.reticle_x||320, ry = d.reticle_y||240;
+    ctx.strokeStyle='#ff4400'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.arc(rx,ry,18,0,2*Math.PI); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(rx-28,ry); ctx.lineTo(rx+28,ry); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(rx,ry-28); ctx.lineTo(rx,ry+28); ctx.stroke();
+    ctx.fillStyle='#ff4400'; ctx.beginPath(); ctx.arc(rx,ry,3,0,2*Math.PI); ctx.fill();
     // REC dot
     if(d.recording){
       ctx.fillStyle='#f00';ctx.beginPath();ctx.arc(20,20,8,0,2*Math.PI);ctx.fill();
