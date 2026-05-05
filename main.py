@@ -32,7 +32,13 @@ ZONE_CAL_FILE  = BASE_DIR / "zone_calibration.json"
 HOME_FILE      = BASE_DIR / "home_position.json"
 SETTINGS_FILE  = BASE_DIR / "settings.json"
 CAM_FILE       = BASE_DIR / "camera_settings.json"
-RECORDINGS_DIR.mkdir(exist_ok=True)
+RETICLE_FILE = BASE_DIR / "reticle.json"
+reticle = {"x": FRAME_W // 2, "y": FRAME_H // 2}  # pixel offset from center
+if RETICLE_FILE.exists():
+    reticle.update(json.loads(RETICLE_FILE.read_text()))
+
+def save_reticle():
+    RETICLE_FILE.write_text(json.dumps(reticle))
 
 # ─── Camera Settings ─────────────────────────────────────────────────────────
 DEFAULT_CAM = {"brightness":0.0,"contrast":1.0,"saturation":1.0,"sharpness":1.0,"ev":0.0,
@@ -427,8 +433,8 @@ def servo_tracking_loop():
             dets = list(latest_detections)
         t = select_target(dets)
         if t:
-            pan  = servo_angles["pan"]  - ((t["cx"]-FRAME_W/2)/FRAME_W)*66.0
-            tilt = servo_angles["tilt"] - ((t["cy"]-FRAME_H/2)/FRAME_H)*41.0
+            pan  = servo_angles["pan"]  - ((t["cx"]-reticle["x"])/FRAME_W)*66.0
+            tilt = servo_angles["tilt"] - ((t["cy"]-reticle["y"])/FRAME_H)*41.0
             move_servos(pan, tilt)
         time.sleep(0.05)
 
@@ -445,7 +451,7 @@ def firing_loop():
         if not t:
             GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
             firing["active"] = False; time.sleep(0.1); continue
-        dist = np.sqrt((t["cx"]-FRAME_W//2)**2+(t["cy"]-FRAME_H//2)**2)
+        dist = np.sqrt((t["cx"]-reticle["x"])**2+(t["cy"]-reticle["y"])**2)
         if dist > state["on_target_tolerance"]:
             time.sleep(0.05); continue
         if state["firing_mode"] == "single":
@@ -580,6 +586,7 @@ def status():
         "n_total_positions":n_total,
         "strength":strength,
         "cam":cam_settings,"depth_m":zone_cal["depth_m"],
+        "reticle_x":reticle["x"],"reticle_y":reticle["y"],
     }
 
 @app.post("/settings")
@@ -621,7 +628,20 @@ def go_home():
     move_servos(home_position["pan"],home_position["tilt"]); return {"status":"going home"}
 
 # ─── Setup Endpoints ──────────────────────────────────────────────────────────
-@app.get("/setup/interp_debug")
+@app.post("/reticle")
+async def set_reticle(request: Request):
+    data = await request.json()
+    reticle["x"] = int(data.get("x", FRAME_W // 2))
+    reticle["y"] = int(data.get("y", FRAME_H // 2))
+    save_reticle()
+    return reticle
+
+@app.get("/reticle/reset")
+def reset_reticle():
+    reticle["x"] = FRAME_W // 2
+    reticle["y"] = FRAME_H // 2
+    save_reticle()
+    return reticle
 def interp_debug():
     return get_interpolation_debug(servo_angles["pan"], servo_angles["tilt"])
 
@@ -999,8 +1019,9 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
     <p id="fmsg"></p>
     <div class="ctrl">
       <button class="btn y" id="btn-tgt" onclick="toggleTgt()">▶ Targeting</button>
+      <button class="btn gr" onclick="resetReticle()" id="btn-ret-reset">⊕ Reset Reticle</button>
     </div>
-    <p style="font-size:0.82em;color:#888;margin-top:4px">Drag zone or vertices to correct position.</p>
+    <p style="font-size:0.82em;color:#888;margin-top:4px">Drag zone or vertices to correct position. When targeting, drag the <span style="color:#f40">⊕ orange crosshair</span> to where the water hits.</p>
     <button class="btn g" id="btn-df" onclick="saveForcedPt()">✓ Done</button>
     <button class="btn gr" style="margin-left:8px" onclick="confirmReset()">Start Over</button>
   </div>
@@ -1009,9 +1030,11 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
     <p style="font-size:0.85em;color:#aaa">Pan/tilt anywhere, drag zone to correct it, then save the point.</p>
     <div class="ctrl">
       <button class="btn y" id="btn-tgt-e" onclick="toggleTgt()">▶ Targeting</button>
+      <button class="btn gr" onclick="resetReticle()">⊕ Reset Reticle</button>
       <button class="btn g" onclick="savePointHere()">📍 Save Point Here</button>
       <button class="btn gr" onclick="confirmReset()">Start Over</button>
     </div>
+    <p style="font-size:0.82em;color:#888;margin-top:2px">When targeting, drag the <span style="color:#f40">⊕ orange crosshair</span> to where the water hits.</p>
     <div id="interp-debug" style="font-size:0.78em;color:#aaa;margin:6px 0;padding:6px;background:#111;border-radius:3px;line-height:1.6"></div>
   </div>
 
@@ -1101,6 +1124,7 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
 
 <script>
 // ── State ──────────────────────────────────────────────────────────────────
+const FRAME_W=640,FRAME_H=480;
 let curPage   = 'live';
 let vMode     = 'add';
 let verts     = [];
@@ -1214,8 +1238,19 @@ function setDepth(v){
   fetch('/setup/depth',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({depth_m:parseFloat(v)||null})});
 }
+function resetReticle(){
+  fetch('/reticle/reset').then(r=>r.json()).then(d=>{
+    localReticle={x:d.x,y:d.y};
+  });
+}
+
+let reticleInited = false;
+let localReticle = {x: 320, y: 240};
+let reticleDrag = false;
+
 function toggleTgt(){
-  tgtOn=!tgtOn;
+  targeting_active_local = !targeting_active_local;
+  tgtOn = targeting_active_local;
   ['btn-tgt','btn-tgt-e'].forEach(id=>{
     const el=document.getElementById(id);
     if(el){el.textContent=tgtOn?'⏹ Stop Targeting':'▶ Targeting';
@@ -1291,6 +1326,15 @@ sc.addEventListener('mousedown',e=>{
   const r=sc.getBoundingClientRect();
   const x=Math.round(e.clientX-r.left),y=Math.round(e.clientY-r.top);
 
+  // During targeting, drag the reticle
+  if(targeting_active_local){
+    const dx = x - localReticle.x, dy = y - localReticle.y;
+    if(Math.sqrt(dx*dx+dy*dy) < 30){
+      reticleDrag = true;
+      return;
+    }
+  }
+
   if(vMode==='add'&&!zClosed){
     verts.push([x,y]);
     sendZone();
@@ -1319,6 +1363,10 @@ sc.addEventListener('mousedown',e=>{
 sc.addEventListener('mousemove',e=>{
   const r=sc.getBoundingClientRect();
   const x=Math.round(e.clientX-r.left),y=Math.round(e.clientY-r.top);
+  if(reticleDrag){
+    localReticle = {x, y};
+    return;
+  }
   if(dragIdx>=0){
     verts[dragIdx]=[x-dragOff.x,y-dragOff.y];
   } else if(zoneDrag&&zoneDragStart&&zoneDragOrigin){
@@ -1328,6 +1376,12 @@ sc.addEventListener('mousemove',e=>{
 });
 
 sc.addEventListener('mouseup',()=>{
+  if(reticleDrag){
+    reticleDrag=false;
+    fetch('/reticle',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(localReticle)});
+    return;
+  }
   if(dragIdx>=0){sendZone();dragIdx=-1;sc.style.cursor=zClosed?'grab':'crosshair';}
   else if(zoneDrag){sendZone();zoneDrag=false;zoneDragStart=null;zoneDragOrigin=null;sc.style.cursor='grab';}
 });
@@ -1375,7 +1429,17 @@ function drawOvs(d){
       ctx.fillText('CAT'+(det.is_primary?' [TGT]':'')+' '+det.conf,det.x1,det.y1-4);
     });
 
-    // REC dot
+    // Reticle — always drawn, draggable during targeting
+    const rx = (curPage==='setup' && targeting_active_local) ? localReticle.x : (d.reticle_x||FRAME_W/2);
+    const ry = (curPage==='setup' && targeting_active_local) ? localReticle.y : (d.reticle_y||FRAME_H/2);
+    c.strokeStyle = '#ff4400';
+    c.lineWidth = 2;
+    c.beginPath(); c.arc(rx, ry, 18, 0, 2*Math.PI); c.stroke();
+    c.beginPath(); c.moveTo(rx-28,ry); c.lineTo(rx+28,ry); c.stroke();
+    c.beginPath(); c.moveTo(rx,ry-28); c.lineTo(rx,ry+28); c.stroke();
+    // Small center dot
+    c.fillStyle='#ff4400';
+    c.beginPath(); c.arc(rx,ry,3,0,2*Math.PI); c.fill();
     if(d.recording){
       ctx.fillStyle='#f00';ctx.beginPath();ctx.arc(20,20,8,0,2*Math.PI);ctx.fill();
       ctx.fillStyle='#f00';ctx.font='bold 12px sans-serif';ctx.fillText('REC',32,25);
@@ -1482,7 +1546,10 @@ setInterval(()=>{
       }
     }
 
-    // Camera settings init
+    if(!reticleInited && d.reticle_x){
+      reticleInited=true;
+      localReticle={x:d.reticle_x,y:d.reticle_y};
+    }
     if(d.cam&&!camInit){
       camInit=true;
       ['brightness','contrast','saturation','sharpness','ev','awb_gain_r','awb_gain_b'].forEach(k=>{
