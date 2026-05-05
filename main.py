@@ -164,7 +164,10 @@ rpicam_proc  = None
 
 def build_rpicam_cmd():
     return [
-        "rpicam-vid","--width","640","--height","480","--framerate","30",
+        "rpicam-vid",
+        "--mode","2304:1296:12:P",  # full FOV 2x2 binned sensor mode
+        "--width","640","--height","480",
+        "--framerate","30",
         "--codec","mjpeg","--inline","-o","-","-t","0","--nopreview",
         "--vflip","--hflip",
         "--brightness", str(cam_settings["brightness"]),
