@@ -360,6 +360,7 @@ detection_lock    = threading.Lock()
 # ─── Tracking & Firing ───────────────────────────────────────────────────────
 tracking = {"primary_target_id":None,"target_entry_times":{},"last_seen":{}}
 firing   = {"active":False,"last_fire_time":0}
+inference_seq = 0  # increments each time inference produces new detections
 targeting_active = False
 
 # ─── Recording ───────────────────────────────────────────────────────────────
@@ -407,6 +408,7 @@ def inference_loop():
             prev_in_zone = {d["id"] for d in latest_detections if d["in_zone"]}
             prev_ids     = {d["id"] for d in latest_detections}
             latest_detections = dets
+            inference_seq += 1
         new_ids     = {d["id"] for d in dets}
         new_in_zone = {d["id"] for d in dets if d["in_zone"]}
         for d in dets:
@@ -447,48 +449,53 @@ def select_target(detections):
 
 def servo_tracking_loop():
     _last_log = 0.0
+    _last_seq  = -1
     while True:
         if not state["armed"] or state["setup_phase"] is not None:
             time.sleep(0.05); continue
 
         with detection_lock:
+            cur_seq = inference_seq
             dets = list(latest_detections)
+
+        # Only move once per new inference result
+        if cur_seq == _last_seq:
+            time.sleep(0.02); continue
+        _last_seq = cur_seq
+
         t = select_target(dets)
         if not t:
-            time.sleep(0.05); continue
+            continue
 
         rx = state["reticle_x"]
         ry = state["reticle_y"]
-        err_x = t["cx"] - rx  # pixels: positive = cat is right of reticle
-        err_y = t["cy"] - ry  # pixels: positive = cat is below reticle
+        err_x = t["cx"] - rx  # positive = cat right of reticle
+        err_y = t["cy"] - ry  # positive = cat below reticle
 
-        # Dead zone: within 10px on both axes, no movement needed
         if abs(err_x) < 10 and abs(err_y) < 10:
-            time.sleep(0.05); continue
+            continue
 
-        # Increasing pan moves scene right (cat moves right)
-        # So if cat is right of reticle (err_x > 0): increase pan to move cat right? No —
-        # we want cat to move LEFT toward reticle: decrease pan
-        # Confirmed from log: increasing pan = camera pans left = scene shifts right
-        # cat right of reticle → need cat to move left → pan left (increase pan)
-        # Wait — scene shifts right means cat moves right (further from reticle). Wrong.
-        # Confirmed correct: increasing pan moves scene RIGHT, cat moves RIGHT.
-        # cat RIGHT of reticle → need cat to move LEFT → scene shifts LEFT → decrease pan
-        STEP = 1.5  # degrees per frame
-        step_pan  = -np.sign(err_x) * min(STEP, abs(err_x) / 50 * STEP * 3)
-        step_tilt = -np.sign(err_y) * min(STEP, abs(err_y) / 50 * STEP * 3)
+        # Pan: increasing pan moves scene right → cat moves right
+        # cat right of reticle (err_x>0) → need cat to move left → decrease pan
+        # cat left of reticle (err_x<0) → need cat to move right → increase pan
+        # So: step_pan = -sign(err_x)
+        #
+        # Tilt: increasing tilt moves scene up → cat moves up
+        # cat below reticle (err_y>0) → need cat to move up → increase tilt
+        # cat above reticle (err_y<0) → need cat to move down → decrease tilt
+        # So: step_tilt = +sign(err_y)
 
-        new_pan  = servo_angles["pan"]  + step_pan
-        new_tilt = servo_angles["tilt"] + step_tilt
+        MAX_STEP = 3.0
+        step_pan  = -np.sign(err_x) * min(MAX_STEP, abs(err_x) / 40.0 * MAX_STEP)
+        step_tilt =  np.sign(err_y) * min(MAX_STEP, abs(err_y) / 40.0 * MAX_STEP)
 
-        pan_lim  = PAN_RANGE  * 0.8
-        new_pan  = clamp(new_pan,
-                         max(PAN_MIN,  home_position["pan"]  - pan_lim),
-                         min(PAN_MAX,  home_position["pan"]  + pan_lim))
-        new_tilt = clamp(new_tilt, 60.0, 120.0)
+        new_pan  = clamp(servo_angles["pan"]  + step_pan,
+                         max(PAN_MIN,  home_position["pan"]  - PAN_RANGE*0.8),
+                         min(PAN_MAX,  home_position["pan"]  + PAN_RANGE*0.8))
+        new_tilt = clamp(servo_angles["tilt"] + step_tilt, 60.0, 120.0)
 
         now = time.time()
-        if now - _last_log >= 0.5:
+        if now - _last_log >= 0.3:
             _last_log = now
             log(f"TRACK cat=({t['cx']},{t['cy']}) reticle=({rx},{ry}) "
                 f"err_px=({err_x},{err_y}) "
@@ -496,7 +503,6 @@ def servo_tracking_loop():
                 f"tilt:{servo_angles['tilt']:.1f}->{new_tilt:.1f}")
 
         move_servos(new_pan, new_tilt)
-        time.sleep(0.05)
 
 def firing_loop():
     while True:
