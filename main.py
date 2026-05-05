@@ -492,15 +492,15 @@ def servo_tracking_loop():
         new_pan  = cur_pan  + step_pan
         new_tilt = cur_tilt + step_tilt
 
-        # Clamp to 80% pan / 40% tilt range from home
+        # Clamp to 80% pan / full 60-120° tilt range from home
         pan_lim  = PAN_RANGE  * 0.8
-        tilt_lim = TILT_RANGE * 0.4
+        tilt_lim = 30.0  # allows 60° to 120° from home at 90°
         new_pan  = clamp(new_pan,
                          max(PAN_MIN,  home_position["pan"]  - pan_lim),
                          min(PAN_MAX,  home_position["pan"]  + pan_lim))
         new_tilt = clamp(new_tilt,
-                         max(TILT_MIN, home_position["tilt"] - tilt_lim),
-                         min(TILT_MAX, home_position["tilt"] + tilt_lim))
+                         max(60.0, home_position["tilt"] - tilt_lim),
+                         min(120.0, home_position["tilt"] + tilt_lim))
 
         now = time.time()
         if now - _last_log >= 0.5:
@@ -554,7 +554,9 @@ def targeting_loop():
             GPIO.output(SOLENOID_PIN,GPIO.LOW); time.sleep(1.0)
             GPIO.output(PUMP_PIN,GPIO.LOW); time.sleep(0.5)
         else:
-            GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
+            # Only touch GPIO if firing_loop isn't actively firing
+            if not firing["active"]:
+                GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
             time.sleep(0.1)
 
 def recording_loop():
