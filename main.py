@@ -1260,6 +1260,7 @@ function showPage(page, btn) {
   if(page==='setup'){
     // When entering setup, always get current state and sync verts from server
     fetch('/setup/start').then(r=>r.json()).then(d=>{
+      console.log('setup/start phase:', d.phase);
       applyPhase(d.phase);
       // Immediately sync verts from server zone data
       fetch('/status').then(r=>r.json()).then(s=>{
