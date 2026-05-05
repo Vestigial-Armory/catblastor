@@ -359,6 +359,8 @@ detection_lock    = threading.Lock()
 
 # ─── Tracking & Firing ───────────────────────────────────────────────────────
 tracking = {"primary_target_id":None,"target_entry_times":{},"last_seen":{}}
+world_target = {"pan":None,"tilt":None}  # absolute angle where cat is in world space
+world_target_lock = threading.Lock()
 firing   = {"active":False,"last_fire_time":0}
 targeting_active = False
 
@@ -391,6 +393,9 @@ def inference_loop():
         with frame_lock:
             if latest_frame is None: time.sleep(0.05); continue
             frame = latest_frame.copy()
+        # Snapshot servo angles at the exact moment inference ran
+        pan_now  = servo_angles["pan"]
+        tilt_now = servo_angles["tilt"]
         results = model(frame, verbose=False)
         sx, sy = FRAME_W/INFER_W, FRAME_H/INFER_H
         dets = []
@@ -406,6 +411,21 @@ def inference_loop():
             prev_in_zone = {d["id"] for d in latest_detections if d["in_zone"]}
             prev_ids     = {d["id"] for d in latest_detections}
             latest_detections = dets
+
+        # Compute world target from primary in-zone cat at inference-time servo angles
+        in_zone_dets = [d for d in dets if d["in_zone"]]
+        with world_target_lock:
+            if in_zone_dets:
+                t = in_zone_dets[0]
+                rx = state["reticle_x"]; ry = state["reticle_y"]
+                world_target["pan"]  = pan_now  - ((t["cx"] - rx) / FRAME_W) * 66.0
+                world_target["tilt"] = tilt_now - ((t["cy"] - ry) / FRAME_H) * 41.0
+                log(f"TARGET pan_now={pan_now:.1f} tilt_now={tilt_now:.1f} "
+                    f"cx={t['cx']} cy={t['cy']} rx={rx} ry={ry} "
+                    f"→ target_pan={world_target['pan']:.1f} target_tilt={world_target['tilt']:.1f}")
+            else:
+                world_target["pan"]  = None
+                world_target["tilt"] = None
         new_ids     = {d["id"] for d in dets}
         new_in_zone = {d["id"] for d in dets if d["in_zone"]}
         for d in dets:
@@ -449,37 +469,47 @@ def servo_tracking_loop():
     while True:
         if not state["armed"] or state["setup_phase"] is not None:
             time.sleep(0.05); continue
-        with detection_lock:
-            dets = list(latest_detections)
-        t = select_target(dets)
-        if t:
-            rx = state.get("reticle_x", FRAME_W // 2)
-            ry = state.get("reticle_y", FRAME_H // 2)
-            err_pan  = ((t["cx"] - rx) / FRAME_W) * 66.0
-            err_tilt = ((t["cy"] - ry) / FRAME_H) * 41.0
-            # Clamp to 2° per frame — prevents runaway when inference lags
-            MAX_STEP = 2.0
-            step_pan  = max(-MAX_STEP, min(MAX_STEP, err_pan))
-            step_tilt = max(-MAX_STEP, min(MAX_STEP, err_tilt))
-            new_pan  = servo_angles["pan"]  - step_pan
-            new_tilt = servo_angles["tilt"] - step_tilt
-            # Clamp to 80% pan / 40% tilt range from home
-            pan_lim  = PAN_RANGE  * 0.8
-            tilt_lim = TILT_RANGE * 0.4
-            new_pan  = clamp(new_pan,
-                             max(PAN_MIN,  home_position["pan"]  - pan_lim),
-                             min(PAN_MAX,  home_position["pan"]  + pan_lim))
-            new_tilt = clamp(new_tilt,
-                             max(TILT_MIN, home_position["tilt"] - tilt_lim),
-                             min(TILT_MAX, home_position["tilt"] + tilt_lim))
-            now = time.time()
-            if now - _last_log >= 0.5:
-                _last_log = now
-                log(f"TRACK cx={t['cx']} cy={t['cy']} reticle=({rx},{ry}) "
-                    f"err=({err_pan:.1f},{err_tilt:.1f}) "
-                    f"pan:{servo_angles['pan']:.1f}->{new_pan:.1f} "
-                    f"tilt:{servo_angles['tilt']:.1f}->{new_tilt:.1f}")
-            move_servos(new_pan, new_tilt)
+
+        with world_target_lock:
+            target_pan  = world_target["pan"]
+            target_tilt = world_target["tilt"]
+
+        if target_pan is None or target_tilt is None:
+            time.sleep(0.05); continue
+
+        cur_pan  = servo_angles["pan"]
+        cur_tilt = servo_angles["tilt"]
+        err_pan  = target_pan  - cur_pan
+        err_tilt = target_tilt - cur_tilt
+
+        # If already within 0.5° on both axes, no movement needed
+        if abs(err_pan) < 0.5 and abs(err_tilt) < 0.5:
+            time.sleep(0.05); continue
+
+        MAX_STEP = 2.0
+        step_pan  = max(-MAX_STEP, min(MAX_STEP, err_pan))
+        step_tilt = max(-MAX_STEP, min(MAX_STEP, err_tilt))
+        new_pan  = cur_pan  + step_pan
+        new_tilt = cur_tilt + step_tilt
+
+        # Clamp to 80% pan / 40% tilt range from home
+        pan_lim  = PAN_RANGE  * 0.8
+        tilt_lim = TILT_RANGE * 0.4
+        new_pan  = clamp(new_pan,
+                         max(PAN_MIN,  home_position["pan"]  - pan_lim),
+                         min(PAN_MAX,  home_position["pan"]  + pan_lim))
+        new_tilt = clamp(new_tilt,
+                         max(TILT_MIN, home_position["tilt"] - tilt_lim),
+                         min(TILT_MAX, home_position["tilt"] + tilt_lim))
+
+        now = time.time()
+        if now - _last_log >= 0.5:
+            _last_log = now
+            log(f"TRACK err=({err_pan:.1f},{err_tilt:.1f}) "
+                f"step=({step_pan:.1f},{step_tilt:.1f}) "
+                f"pan:{cur_pan:.1f}->{new_pan:.1f} tilt:{cur_tilt:.1f}->{new_tilt:.1f}")
+
+        move_servos(new_pan, new_tilt)
         time.sleep(0.05)
 
 def firing_loop():
@@ -495,8 +525,9 @@ def firing_loop():
         if not t:
             GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
             firing["active"] = False; time.sleep(0.1); continue
-        dist = np.sqrt((t["cx"]-FRAME_W//2)**2+(t["cy"]-FRAME_H//2)**2)
-        if dist > state["on_target_tolerance"]:
+        dist = np.sqrt((servo_angles["pan"]  - (world_target["pan"]  or 9999))**2 +
+                       (servo_angles["tilt"] - (world_target["tilt"] or 9999))**2)
+        if dist > 2.0:  # within 2° = on target
             time.sleep(0.05); continue
         if state["firing_mode"] == "single":
             if now - firing["last_fire_time"] >= state["reload_time"]:
@@ -1191,6 +1222,8 @@ let zClosed   = false;
 let dragIdx   = -1;
 let dragOff   = {x:0,y:0};
 let tgtOn     = false;
+let reticleDragging = false;
+let lastStatus = {reticle_x:320, reticle_y:240};
 let curPhase  = null;
 let camInit   = false;
 
@@ -1374,6 +1407,14 @@ sc.addEventListener('mousedown',e=>{
   const r=sc.getBoundingClientRect();
   const x=Math.round(e.clientX-r.left),y=Math.round(e.clientY-r.top);
 
+  // When targeting active, dragging reticle takes priority
+  if(tgtOn){
+    const rx=lastStatus.reticle_x||320, ry=lastStatus.reticle_y||240;
+    if(Math.sqrt((x-rx)**2+(y-ry)**2)<30){
+      reticleDragging=true; sc.style.cursor='crosshair'; return;
+    }
+  }
+
   if(vMode==='add'&&!zClosed){
     verts.push([x,y]);
     sendZone();
@@ -1385,7 +1426,6 @@ sc.addEventListener('mousedown',e=>{
     if(i>=0){verts.splice(i,1);if(verts.length<3)zClosed=false;sendZone();updDrawBtns();}
     return;
   }
-  // Default: vertex grab takes priority, then whole zone drag
   const vi = nearV(x,y,15);
   if(vi>=0){
     dragIdx=vi;
@@ -1402,6 +1442,11 @@ sc.addEventListener('mousedown',e=>{
 sc.addEventListener('mousemove',e=>{
   const r=sc.getBoundingClientRect();
   const x=Math.round(e.clientX-r.left),y=Math.round(e.clientY-r.top);
+  if(reticleDragging){
+    // Draw reticle at new position immediately (overlay will update on next status poll)
+    lastStatus.reticle_x=x; lastStatus.reticle_y=y;
+    return;
+  }
   if(dragIdx>=0){
     verts[dragIdx]=[x-dragOff.x,y-dragOff.y];
   } else if(zoneDrag&&zoneDragStart&&zoneDragOrigin){
@@ -1410,7 +1455,16 @@ sc.addEventListener('mousemove',e=>{
   }
 });
 
-sc.addEventListener('mouseup',()=>{
+sc.addEventListener('mouseup',e=>{
+  if(reticleDragging){
+    reticleDragging=false;
+    sc.style.cursor='crosshair';
+    const r=sc.getBoundingClientRect();
+    const x=Math.round(e.clientX-r.left),y=Math.round(e.clientY-r.top);
+    fetch('/reticle',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({x,y})});
+    return;
+  }
   if(dragIdx>=0){sendZone();dragIdx=-1;sc.style.cursor=zClosed?'grab':'crosshair';}
   else if(zoneDrag){sendZone();zoneDrag=false;zoneDragStart=null;zoneDragOrigin=null;sc.style.cursor='grab';}
 });
@@ -1525,6 +1579,7 @@ function updCam(){
 // ── Status Polling ─────────────────────────────────────────────────────────
 setInterval(()=>{
   fetch('/status').then(r=>r.json()).then(d=>{
+    lastStatus = d;
     // Status bar
     document.getElementById('da').className='dot '+(d.armed?'on':'');
     document.getElementById('ta').textContent=d.armed?'Armed':'Disarmed';
