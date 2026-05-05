@@ -667,7 +667,8 @@ def recording_loop():
 
         time.sleep(1/30)
 
-_last_cat_seen = time.time()
+_last_cat_seen       = time.time()
+_last_user_input_time = time.time()
 
 def home_position_loop():
     global _last_cat_seen
@@ -680,9 +681,12 @@ def home_position_loop():
         if cats > 0:
             _last_cat_seen = time.time()
             continue
+        now  = time.time()
         away = (abs(servo_angles["pan"]  - home_position["pan"])  > 1.0 or
                 abs(servo_angles["tilt"] - home_position["tilt"]) > 1.0)
-        if away and (time.time() - _last_cat_seen) > 5.0:
+        no_cat_5s   = (now - _last_cat_seen)        > 5.0
+        no_input_5s = (now - _last_user_input_time) > 5.0
+        if away and no_cat_5s and no_input_5s:
             log(f"HOME pan={servo_angles['pan']:.1f}->{home_position['pan']:.1f} "
                 f"tilt={servo_angles['tilt']:.1f}->{home_position['tilt']:.1f}")
             move_servos(home_position["pan"], home_position["tilt"], slow=True)
@@ -782,9 +786,11 @@ async def update_camera(request: Request):
 
 @app.post("/servos/move")
 async def move_servos_ep(request: Request):
+    global _last_user_input_time
     data = await request.json()
     pan  = clamp(servo_angles["pan"]  - data.get("pan_delta",0),  PAN_MIN,  PAN_MAX)
     tilt = clamp(servo_angles["tilt"] + data.get("tilt_delta",0), TILT_MIN, TILT_MAX)
+    _last_user_input_time = time.time()
     move_servos(pan, tilt); return {"pan":pan,"tilt":tilt}
 
 @app.get("/servos/center")
@@ -1801,13 +1807,33 @@ function loadRecs(){
           <span style="color:#888;font-size:0.8em">${f.size_mb}MB · ${f.duration_s}s</span>
         </div>
         <div style="display:flex;gap:6px;flex-wrap:wrap">
-          <a href="/recordings/${f.name}" download><button class="btn b" style="padding:4px 10px;font-size:0.8em">⬇ Download</button></a>
-          <a href="/recordings/${f.name}" target="_blank"><button class="btn gr" style="padding:4px 10px;font-size:0.8em">▶ Play</button></a>
+          <button class="btn b" style="padding:4px 10px;font-size:0.8em" onclick="togglePlay('${f.name}',this)">▶ Play</button>
+          <a href="/recordings/${f.name}" download><button class="btn gr" style="padding:4px 10px;font-size:0.8em">⬇ Download</button></a>
           <button class="btn y" style="padding:4px 10px;font-size:0.8em" onclick="renameRec('${f.name}')">✏ Rename</button>
           <button class="btn r" style="padding:4px 10px;font-size:0.8em" onclick="deleteRec('${f.name}')">✕ Delete</button>
         </div>
+        <div id="player-${CSS.escape(f.name)}" style="display:none;width:100%">
+          <video controls style="width:100%;max-width:640px;background:#000;margin-top:4px">
+            <source src="/recordings/${f.name}" type="video/mp4">
+          </video>
+        </div>
       </div>`).join('');
   });
+}
+
+function togglePlay(name, btn){
+  const p = document.getElementById('player-'+CSS.escape(name));
+  if(!p) return;
+  const visible = p.style.display !== 'none';
+  p.style.display = visible ? 'none' : 'block';
+  btn.textContent = visible ? '▶ Play' : '⏹ Close';
+  if(!visible){
+    const v = p.querySelector('video');
+    if(v) v.play();
+  } else {
+    const v = p.querySelector('video');
+    if(v){ v.pause(); v.currentTime=0; }
+  }
 }
 
 function deleteRec(name){
