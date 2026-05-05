@@ -10,6 +10,7 @@ import numpy as np
 import RPi.GPIO as GPIO
 import os
 import subprocess
+import logging
 from datetime import datetime
 from pathlib import Path
 
@@ -32,7 +33,19 @@ ZONE_CAL_FILE  = BASE_DIR / "zone_calibration.json"
 HOME_FILE      = BASE_DIR / "home_position.json"
 SETTINGS_FILE  = BASE_DIR / "settings.json"
 CAM_FILE       = BASE_DIR / "camera_settings.json"
-RETICLE_FILE = BASE_DIR / "reticle.json"
+RETICLE_FILE   = BASE_DIR / "reticle.json"
+LOG_FILE       = BASE_DIR / "catblastor_events.log"
+RECORDINGS_DIR.mkdir(exist_ok=True)
+
+# ─── Event Logger ─────────────────────────────────────────────────────────────
+event_logger = logging.getLogger("catblastor")
+event_logger.setLevel(logging.DEBUG)
+_fh = logging.FileHandler(str(LOG_FILE))
+_fh.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+event_logger.addHandler(_fh)
+
+def log(msg):
+    event_logger.info(msg)
 reticle = {"x": FRAME_W // 2, "y": FRAME_H // 2}  # pixel offset from center
 if RETICLE_FILE.exists():
     reticle.update(json.loads(RETICLE_FILE.read_text()))
@@ -397,7 +410,22 @@ def inference_loop():
                 dets.append({"id":f"{cx}_{cy}","x1":x1,"y1":y1,"x2":x2,"y2":y2,
                              "cx":cx,"cy":cy,"conf":conf,"in_zone":point_in_zone(cx,cy)})
         with detection_lock:
+            prev_ids = {d["id"] for d in latest_detections}
+            prev_zone_ids = {d["id"] for d in latest_detections if d["in_zone"]}
             latest_detections = dets
+
+        # Log new detections and zone entries
+        new_ids = {d["id"] for d in dets}
+        new_zone_ids = {d["id"] for d in dets if d["in_zone"]}
+        for d in dets:
+            if d["id"] not in prev_ids:
+                log(f"DETECT  cat={d['id']} cx={d['cx']} cy={d['cy']} conf={d['conf']:.2f}")
+            if d["id"] not in prev_zone_ids and d["in_zone"]:
+                log(f"ZONE_IN cat={d['id']} cx={d['cx']} cy={d['cy']} pan={round(servo_angles['pan'],1)} tilt={round(servo_angles['tilt'],1)}")
+        for lost_id in prev_zone_ids - new_zone_ids:
+            log(f"ZONE_OUT cat={lost_id}")
+        for lost_id in prev_ids - new_ids:
+            log(f"LOST    cat={lost_id}")
 
 def select_target(detections):
     in_zone = [d for d in detections if d["in_zone"]]
@@ -426,6 +454,7 @@ def select_target(detections):
     return t
 
 def servo_tracking_loop():
+    _last_log = 0.0
     while True:
         if not state["armed"] or state["setup_phase"] is not None:
             time.sleep(0.05); continue
@@ -435,20 +464,13 @@ def servo_tracking_loop():
         if not t:
             time.sleep(0.05); continue
 
-        # Compute angular error — camera upside down so both axes inverted
         err_pan  = ((t["cx"] - reticle["x"]) / FRAME_W) * 66.0
         err_tilt = ((t["cy"] - reticle["y"]) / FRAME_H) * 41.0
-
-        # Clamp step per frame for stability (inference ~1fps, tracking 20fps)
         MAX_STEP = 2.0
         step_pan  = max(-MAX_STEP, min(MAX_STEP, err_pan))
         step_tilt = max(-MAX_STEP, min(MAX_STEP, err_tilt))
-
-        # Camera upside down: pan and tilt directions both inverted vs normal
         new_pan  = servo_angles["pan"]  + step_pan
         new_tilt = servo_angles["tilt"] + step_tilt
-
-        # Clamp to 80% of pan range and 40% of tilt range from home
         pan_limit  = PAN_RANGE  * 0.8
         tilt_limit = TILT_RANGE * 0.4
         new_pan  = clamp(new_pan,
@@ -457,13 +479,19 @@ def servo_tracking_loop():
         new_tilt = clamp(new_tilt,
                          max(TILT_MIN, home_position["tilt"] - tilt_limit),
                          min(TILT_MAX, home_position["tilt"] + tilt_limit))
+        # Log at 2Hz to avoid flooding
+        now = time.time()
+        if now - _last_log >= 0.5:
+            _last_log = now
+            log(f"TRACK   cat=({t['cx']},{t['cy']}) reticle=({reticle['x']},{reticle['y']}) "
+                f"err=({err_pan:.1f}°,{err_tilt:.1f}°) step=({step_pan:.1f},{step_tilt:.1f}) "
+                f"pan:{servo_angles['pan']:.1f}→{new_pan:.1f} tilt:{servo_angles['tilt']:.1f}→{new_tilt:.1f}")
         move_servos(new_pan, new_tilt)
         time.sleep(0.05)
 
 def firing_loop():
     while True:
         if not state["armed"] or state["setup_phase"] is not None:
-            # Don't touch GPIO if targeting calibration is active — targeting_loop owns the pins
             if not targeting_active:
                 GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
             firing["active"] = False; time.sleep(0.1); continue
@@ -486,9 +514,11 @@ def firing_loop():
 
 def _fire_burst():
     firing["active"] = True
+    log(f"FIRE    pan={servo_angles['pan']:.1f} tilt={servo_angles['tilt']:.1f} burst={state['burst_length']}s")
     GPIO.output(PUMP_PIN,GPIO.HIGH); GPIO.output(SOLENOID_PIN,GPIO.HIGH)
     time.sleep(state["burst_length"])
     GPIO.output(SOLENOID_PIN,GPIO.LOW); GPIO.output(PUMP_PIN,GPIO.LOW)
+    log(f"FIRE_END")
     firing["active"] = False
 
 def targeting_loop():
@@ -549,6 +579,7 @@ def home_position_loop():
             abs(servo_angles["tilt"] - home_position["tilt"]) > 1.0
         )
         if away_from_home and (time.time() - last_detection_time) > 5.0:
+            log(f"HOME    returning pan={servo_angles['pan']:.1f}→{home_position['pan']:.1f} tilt={servo_angles['tilt']:.1f}→{home_position['tilt']:.1f}")
             move_servos(home_position["pan"], home_position["tilt"], slow=True)
 
 # ─── Start Threads ───────────────────────────────────────────────────────────
@@ -578,13 +609,16 @@ def stream():
 
 @app.get("/arm")
 def arm():
-    state["armed"] = True; return {"status":"armed"}
+    state["armed"] = True
+    log(f"ARM     pan={servo_angles['pan']:.1f} tilt={servo_angles['tilt']:.1f}")
+    return {"status":"armed"}
 
 @app.get("/disarm")
 def disarm():
     global targeting_active
     state["armed"] = False; targeting_active = False
     GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
+    log("DISARM")
     return {"status":"disarmed"}
 
 @app.get("/status")
@@ -916,7 +950,18 @@ def get_recording(filename: str):
     if path.exists(): return FileResponse(str(path), media_type="video/mp4")
     return {"error":"not found"}
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/log")
+def get_log():
+    if LOG_FILE.exists():
+        return FileResponse(str(LOG_FILE), media_type="text/plain",
+                            filename="catblastor_events.log")
+    return {"error": "no log file yet"}
+
+@app.get("/log/clear")
+def clear_log():
+    LOG_FILE.write_text("")
+    log("LOG_CLEARED")
+    return {"status": "cleared"}
 def index(): return HTML
 
 # ─── Frontend ────────────────────────────────────────────────────────────────
@@ -996,8 +1041,14 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
     <button class="btn gr" onclick="fetch('/servos/center')">Center</button>
     <button class="btn gr" onclick="fetch('/servos/home/go')">🏠 Home</button>
     <button class="btn gr" onclick="fetch('/servos/home/set')">📌 Set Home</button>
+    <a href="/log" download><button class="btn gr">📋 Download Log</button></a>
+    <button class="btn gr" onclick="fetch('/log/clear')">🗑 Clear Log</button>
   </div>
   <div id="track-dbg" style="font-family:monospace;font-size:0.78em;color:#8af;background:#111;padding:6px 10px;border-radius:4px;margin:4px 0;display:none;max-width:640px;line-height:1.7"></div>
+  <div style="display:flex;gap:8px;align-items:center;margin:2px 0">
+    <button class="btn gr" style="font-size:0.78em;padding:3px 10px" onclick="dbgFrozen=!dbgFrozen;this.textContent=dbgFrozen?'▶ Unfreeze':'❄ Freeze Debug'">❄ Freeze Debug</button>
+    <span id="track-dbg-last" style="font-family:monospace;font-size:0.75em;color:#666"></span>
+  </div>
   <div class="ctrl">
     <span style="color:#aaa;font-size:0.85em">Pan/Tilt:</span>
     <button class="btn gr" onclick="mv(0,-5)">▲</button>
@@ -1190,7 +1241,7 @@ let tgtOn     = false;
 let targeting_active_local = false;
 let localReticle = {x: 320, y: 240};
 let reticleDrag  = false;
-let reticleInited = false;
+let dbgFrozen = false;
 let curPhase  = null;
 let camInit   = false;
 
@@ -1606,15 +1657,18 @@ setInterval(()=>{
 
     // Tracking debug panel — visible on live page when cat in zone
     const dbgEl = document.getElementById('track-dbg');
-    if(dbgEl){
+    const dbgLast = document.getElementById('track-dbg-last');
+    if(dbgEl && !dbgFrozen){
       if(d.track_debug){
         const td = d.track_debug;
+        const txt =
+          `cat:(${td.cat_cx},${td.cat_cy}) reticle:(${td.reticle_x},${td.reticle_y})\n`+
+          `err_pan:${td.err_pan_deg}°  err_tilt:${td.err_tilt_deg}°\n`+
+          `step: pan${td.step_pan>=0?'+':''}${td.step_pan}°  tilt${td.step_tilt>=0?'+':''}${td.step_tilt}°\n`+
+          `pan:${td.current_pan}° → ${td.cmd_pan}°    tilt:${td.current_tilt}° → ${td.cmd_tilt}°`;
         dbgEl.style.display='block';
-        dbgEl.innerHTML=
-          `cat:(${td.cat_cx},${td.cat_cy}) reticle:(${td.reticle_x},${td.reticle_y})<br>`+
-          `err_pan:${td.err_pan_deg}°  err_tilt:${td.err_tilt_deg}°<br>`+
-          `step:pan${td.step_pan>=0?'+':''}${td.step_pan}°  tilt${td.step_tilt>=0?'+':''}${td.step_tilt}°<br>`+
-          `pan:${td.current_pan}°→<b>${td.cmd_pan}°</b>  tilt:${td.current_tilt}°→<b>${td.cmd_tilt}°</b>`;
+        dbgEl.innerText = txt;
+        if(dbgLast) dbgLast.textContent = '(last: '+new Date().toLocaleTimeString()+')';
       } else {
         dbgEl.style.display='none';
       }
