@@ -36,6 +36,7 @@ CAM_FILE       = BASE_DIR / "camera_settings.json"
 RECORDINGS_DIR.mkdir(exist_ok=True)
 
 RETICLE_FILE = BASE_DIR / "reticle.json"
+LOG_FILE     = BASE_DIR / "catblastor_events.log"
 _log_handler = logging.FileHandler(str(LOG_FILE))
 _log_handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 _logger = logging.getLogger("cb")
