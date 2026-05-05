@@ -432,17 +432,32 @@ def servo_tracking_loop():
         with detection_lock:
             dets = list(latest_detections)
         t = select_target(dets)
-        if t:
-            # Compute full angular correction needed
-            err_pan  = ((t["cx"] - reticle["x"]) / FRAME_W)  * 66.0
-            err_tilt = ((t["cy"] - reticle["y"]) / FRAME_H)  * 41.0
-            # Clamp step to 2° max per frame — prevents runaway when inference is slow
-            MAX_STEP = 2.0
-            step_pan  = max(-MAX_STEP, min(MAX_STEP, err_pan))
-            step_tilt = max(-MAX_STEP, min(MAX_STEP, err_tilt))
-            pan  = servo_angles["pan"]  - step_pan
-            tilt = servo_angles["tilt"] - step_tilt
-            move_servos(pan, tilt)
+        if not t:
+            time.sleep(0.05); continue
+
+        # Compute angular error — camera upside down so both axes inverted
+        err_pan  = ((t["cx"] - reticle["x"]) / FRAME_W) * 66.0
+        err_tilt = ((t["cy"] - reticle["y"]) / FRAME_H) * 41.0
+
+        # Clamp step per frame for stability (inference ~1fps, tracking 20fps)
+        MAX_STEP = 2.0
+        step_pan  = max(-MAX_STEP, min(MAX_STEP, err_pan))
+        step_tilt = max(-MAX_STEP, min(MAX_STEP, err_tilt))
+
+        # Camera upside down: pan and tilt directions both inverted vs normal
+        new_pan  = servo_angles["pan"]  + step_pan
+        new_tilt = servo_angles["tilt"] + step_tilt
+
+        # Clamp to 80% of pan range and 40% of tilt range from home
+        pan_limit  = PAN_RANGE  * 0.8
+        tilt_limit = TILT_RANGE * 0.4
+        new_pan  = clamp(new_pan,
+                         max(PAN_MIN,  home_position["pan"]  - pan_limit),
+                         min(PAN_MAX,  home_position["pan"]  + pan_limit))
+        new_tilt = clamp(new_tilt,
+                         max(TILT_MIN, home_position["tilt"] - tilt_limit),
+                         min(TILT_MAX, home_position["tilt"] + tilt_limit))
+        move_servos(new_pan, new_tilt)
         time.sleep(0.05)
 
 def firing_loop():
@@ -515,15 +530,26 @@ def recording_loop():
                 recording["writer"] = None; recording["active"] = False
         time.sleep(1/15)
 
+last_detection_time = time.time()
+
 def home_position_loop():
+    global last_detection_time
     while True:
-        time.sleep(5)
-        if not state["armed"] or state["setup_phase"] is not None: continue
+        time.sleep(0.5)
+        if not state["armed"] or state["setup_phase"] is not None:
+            continue
         with detection_lock:
             cats = len(latest_detections)
-        if cats == 0 and not firing["active"]:
-            if time.time() - last_activity_time > HOME_TIMEOUT:
-                move_servos(home_position["pan"], home_position["tilt"])
+        if cats > 0:
+            last_detection_time = time.time()
+            continue
+        # No cat detected — return home after 5s if camera has moved from home
+        away_from_home = (
+            abs(servo_angles["pan"]  - home_position["pan"])  > 1.0 or
+            abs(servo_angles["tilt"] - home_position["tilt"]) > 1.0
+        )
+        if away_from_home and (time.time() - last_detection_time) > 5.0:
+            move_servos(home_position["pan"], home_position["tilt"], slow=True)
 
 # ─── Start Threads ───────────────────────────────────────────────────────────
 threading.Thread(target=start_streaming,     daemon=True).start()
