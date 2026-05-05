@@ -299,29 +299,38 @@ def servo_pct(angle, center, rang):
 zone_vertices = list(zone_cal.get("home_vertices", []))
 zone_closed   = bool(zone_cal.get("home_closed", False))
 
+def get_live_zone():
+    """For live mode: always interpolate — smooth continuous zone tracking.
+    Saved points anchor the model; zone moves fluidly with the camera."""
+    pan, tilt = servo_angles["pan"], servo_angles["tilt"]
+    pts = zone_cal["calibration_points"]
+    if not pts:
+        return zone_vertices, zone_closed
+    if len(pts) == 1:
+        return pts[0]["vertices"], True
+    interp = interpolate_zone(pan, tilt)
+    if interp:
+        return interp, True
+    return zone_vertices, zone_closed
+
 def get_setup_zone():
-    """Return zone for current servo position.
-    - If a saved point is within 2.5° (half grid step), return it exactly.
-    - Otherwise interpolate from all saved points.
-    - User-set points are never modified by interpolation.
-    """
+    """For setup mode: snap to exact saved position if within 0.6°, else interpolate.
+    User sees exactly what they saved at each calibration position."""
     pan, tilt = servo_angles["pan"], servo_angles["tilt"]
     pts = zone_cal["calibration_points"]
     if not pts:
         return zone_vertices, zone_closed, False
-    # Find nearest saved calibration point
-    def dist(p): return np.sqrt((pan-p["pan"])**2 + (tilt-p["tilt"])**2)
+    def dist(p): return float(np.sqrt((pan-p["pan"])**2 + (tilt-p["tilt"])**2))
     nearest = min(pts, key=dist)
-    if dist(nearest) < 2.5:
+    if dist(nearest) < 0.6:
         return nearest["vertices"], True, True
-    # Outside 2.5° of any saved point — interpolate
     interp = interpolate_zone(pan, tilt)
     if interp:
         return interp, True, False
     return zone_vertices, zone_closed, False
 
 def get_current_zone():
-    verts, closed, _ = get_setup_zone()
+    verts, closed = get_live_zone()
     return verts, closed
 
 def point_in_zone(cx, cy):
@@ -546,7 +555,7 @@ def status():
                  "conf":round(d["conf"],2),"in_zone":d["in_zone"],
                  "is_primary":d["id"]==tracking["primary_target_id"]}
                 for d in latest_detections]
-    zone_px, z_closed = get_current_zone()
+    zone_px, z_closed = get_live_zone()
     setup_verts, setup_closed, is_exact = get_setup_zone()
     strength = compute_calibration_strength()
     gp = grid_snap(servo_angles["pan"])
