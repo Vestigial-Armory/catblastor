@@ -962,6 +962,8 @@ def clear_log():
     LOG_FILE.write_text("")
     log("LOG_CLEARED")
     return {"status": "cleared"}
+
+@app.get("/", response_class=HTMLResponse)
 def index(): return HTML
 
 # ─── Frontend ────────────────────────────────────────────────────────────────
