@@ -596,6 +596,7 @@ def status():
                  "conf":round(d["conf"],2),"in_zone":d["in_zone"],
                  "is_primary":d["id"]==tracking["primary_target_id"]}
                 for d in latest_detections]
+    zone_px, z_closed = get_live_zone()
     # Tracking debug — shows exactly what the formula is computing
     track_debug = None
     with detection_lock:
