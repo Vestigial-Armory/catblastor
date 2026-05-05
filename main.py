@@ -730,6 +730,8 @@ def reset_reticle():
     reticle["y"] = FRAME_H // 2
     save_reticle()
     return reticle
+
+@app.get("/setup/interp_debug")
 def interp_debug():
     return get_interpolation_debug(servo_angles["pan"], servo_angles["tilt"])
 
