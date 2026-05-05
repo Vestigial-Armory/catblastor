@@ -35,13 +35,7 @@ SETTINGS_FILE  = BASE_DIR / "settings.json"
 CAM_FILE       = BASE_DIR / "camera_settings.json"
 RECORDINGS_DIR.mkdir(exist_ok=True)
 
-FOV_FILE = BASE_DIR / "fov.json"
-fov = {"h": 66.0, "v": 41.0}
-if FOV_FILE.exists():
-    fov.update(json.loads(FOV_FILE.read_text()))
-
-def save_fov():
-    FOV_FILE.write_text(json.dumps(fov))
+LOG_FILE = BASE_DIR / "catblastor_events.log"
 _log_handler = logging.FileHandler(str(LOG_FILE))
 _log_handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 _logger = logging.getLogger("cb")
@@ -403,10 +397,6 @@ def inference_loop():
         pan_now  = servo_angles["pan"]
         tilt_now = servo_angles["tilt"]
         results = model(frame, verbose=False)
-        # Also snapshot previous target for direction verification
-        with world_target_lock:
-            prev_target_pan  = world_target["pan"]
-            prev_target_tilt = world_target["tilt"]
         sx, sy = FRAME_W/INFER_W, FRAME_H/INFER_H
         dets = []
         for r in results[0].boxes:
@@ -428,14 +418,8 @@ def inference_loop():
             if in_zone_dets:
                 t = in_zone_dets[0]
                 rx = state["reticle_x"]; ry = state["reticle_y"]
-                # Log how cat pixel moved vs how servo moved — tells us the sign empirically
-                if prev_target_pan is not None:
-                    dpan  = round(pan_now  - prev_target_pan,  1)
-                    dtilt = round(tilt_now - prev_target_tilt, 1)
-                    log(f"DIRECTION servo_delta=({dpan},{dtilt}) cat_pixel=({t['cx']},{t['cy']}) "
-                        f"[if servo moved RIGHT (+pan) and cat moved LEFT (-cx), signs are NORMAL]")
-                world_target["pan"]  = pan_now  - ((t["cx"] - rx) / FRAME_W) * fov["h"]
-                world_target["tilt"] = tilt_now - ((t["cy"] - ry) / FRAME_H) * fov["v"]
+                world_target["pan"]  = pan_now  - ((t["cx"] - rx) / FRAME_W) * 66.0
+                world_target["tilt"] = tilt_now - ((t["cy"] - ry) / FRAME_H) * 41.0
                 log(f"TARGET pan_now={pan_now:.1f} tilt_now={tilt_now:.1f} "
                     f"cx={t['cx']} cy={t['cy']} rx={rx} ry={ry} "
                     f"→ target_pan={world_target['pan']:.1f} target_tilt={world_target['tilt']:.1f}")
@@ -695,7 +679,6 @@ def status():
         "strength":strength,
         "cam":cam_settings,"depth_m":zone_cal["depth_m"],
         "reticle_x":state["reticle_x"],"reticle_y":state["reticle_y"],
-        "fov_h":fov["h"],"fov_v":fov["v"],
     }
 
 @app.post("/settings")
@@ -958,19 +941,6 @@ def get_recording(filename: str):
     if path.exists(): return FileResponse(str(path), media_type="video/mp4")
     return {"error":"not found"}
 
-@app.get("/fov")
-def get_fov():
-    return fov
-
-@app.post("/fov")
-async def set_fov(request: Request):
-    data = await request.json()
-    if "h" in data: fov["h"] = round(float(data["h"]), 1)
-    if "v" in data: fov["v"] = round(float(data["v"]), 1)
-    save_fov()
-    log(f"FOV updated h={fov['h']} v={fov['v']}")
-    return fov
-
 @app.post("/reticle")
 async def set_reticle(request: Request):
     data = await request.json()
@@ -1161,26 +1131,8 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
     <div id="interp-debug" style="font-size:0.78em;color:#aaa;margin:6px 0;padding:6px;background:#111;border-radius:3px;line-height:1.6"></div>
   </div>
 
-    <details style="margin-top:8px">
-      <summary style="cursor:pointer;color:#aaf;font-size:0.95em;margin-bottom:8px">🎯 Tracking FOV Tuning</summary>
-      <p style="font-size:0.8em;color:#888;margin:4px 0">If camera overshoots the cat, reduce FOV. If it undershoots, increase FOV.</p>
-      <div class="sg" style="margin-top:8px">
-        <div class="set"><label>H-FOV °: <span id="vl-fovh">66.0</span></label>
-          <div style="display:flex;gap:6px;align-items:center">
-            <button class="btn gr" style="padding:4px 8px" onclick="adjFov('h',-1)">−1</button>
-            <button class="btn gr" style="padding:4px 8px" onclick="adjFov('h',-0.5)">−½</button>
-            <button class="btn gr" style="padding:4px 8px" onclick="adjFov('h',0.5)">+½</button>
-            <button class="btn gr" style="padding:4px 8px" onclick="adjFov('h',1)">+1</button>
-          </div></div>
-        <div class="set"><label>V-FOV °: <span id="vl-fovv">41.0</span></label>
-          <div style="display:flex;gap:6px;align-items:center">
-            <button class="btn gr" style="padding:4px 8px" onclick="adjFov('v',-1)">−1</button>
-            <button class="btn gr" style="padding:4px 8px" onclick="adjFov('v',-0.5)">−½</button>
-            <button class="btn gr" style="padding:4px 8px" onclick="adjFov('v',0.5)">+½</button>
-            <button class="btn gr" style="padding:4px 8px" onclick="adjFov('v',1)">+1</button>
-          </div></div>
-      </div>
-    </details>
+  <!-- Settings inside setup for live preview -->
+  <div id="ph-settings" class="ph" style="margin-top:8px">
     <details open>
       <summary style="cursor:pointer;color:#aaf;font-size:0.95em;margin-bottom:8px">⚙ Firing Settings</summary>
       <div class="sg" style="margin-top:8px">
@@ -1599,20 +1551,6 @@ function drawArrow(ctx,cx,cy,w,h){
 }
 
 // ── Settings ───────────────────────────────────────────────────────────────
-function adjFov(axis,delta){
-  fetch('/fov').then(r=>r.json()).then(d=>{
-    const body={};
-    body[axis]=Math.round((d[axis]+delta)*10)/10;
-    fetch('/fov',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(body)}).then(r=>r.json()).then(f=>{
-      const hEl=document.getElementById('vl-fovh');
-      const vEl=document.getElementById('vl-fovv');
-      if(hEl)hEl.textContent=f.h;
-      if(vEl)vEl.textContent=f.v;
-    });
-  });
-}
-
 function updSettings(){
   fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({
@@ -1691,12 +1629,7 @@ setInterval(()=>{
       }
     }
 
-    if(d.fov_h){
-      const hEl=document.getElementById('vl-fovh');
-      const vEl=document.getElementById('vl-fovv');
-      if(hEl)hEl.textContent=d.fov_h;
-      if(vEl)vEl.textContent=d.fov_v;
-    }
+    // Camera settings init
     if(d.cam&&!camInit){
       camInit=true;
       ['brightness','contrast','saturation','sharpness','ev','awb_gain_r','awb_gain_b'].forEach(k=>{
