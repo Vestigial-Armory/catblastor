@@ -385,7 +385,7 @@ def capture_loop():
         time.sleep(1/10)
 
 def inference_loop():
-    global latest_detections
+    global latest_detections, inference_seq
     while True:
         if not state["armed"]:
             latest_detections = []; time.sleep(0.1); continue
