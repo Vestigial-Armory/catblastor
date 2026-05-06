@@ -632,65 +632,77 @@ def targeting_loop():
                 GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
             time.sleep(0.1)
 
+_rec_proc = None
+_rec_test_until = 0.0  # timestamp until which test recording runs
+
+def start_recording():
+    global _rec_proc
+    if recording["active"]:
+        return
+    ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fn  = RECORDINGS_DIR / f"catblastor_{ts}.mp4"
+    recording["filename"] = str(fn)
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "mjpeg",
+        "-framerate", "30",
+        "-i", "pipe:0",
+        "-vf", "format=yuv420p",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-movflags", "+faststart",
+        str(fn)
+    ]
+    _rec_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    recording["active"] = True
+    log(f"REC_START {fn.name}")
+
+def stop_recording():
+    global _rec_proc
+    if _rec_proc and _rec_proc.poll() is None:
+        try: _rec_proc.stdin.close()
+        except Exception: pass
+        _rec_proc.wait(timeout=5)
+    _rec_proc = None
+    recording["active"] = False
+    recording["filename"] = None
+    log("REC_STOP")
+
 def recording_loop():
     """Records directly from MJPEG stream via ffmpeg — true 30fps, faststart for browser playback."""
-    rec_proc = None
-
-    def start_recording():
-        ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fn  = RECORDINGS_DIR / f"catblastor_{ts}.mp4"
-        recording["filename"] = str(fn)
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "mjpeg",
-            "-framerate", "30",
-            "-i", "pipe:0",
-            "-vf", "format=yuv420p",
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-movflags", "+faststart",
-            str(fn)
-        ]
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        recording["active"] = True
-        log(f"REC_START {fn.name}")
-        return proc
-
-    def stop_recording(proc):
-        if proc and proc.poll() is None:
-            try: proc.stdin.close()
-            except Exception: pass
-            proc.wait(timeout=5)
-        recording["active"] = False
-        recording["filename"] = None
-        log("REC_STOP")
-
+    global _rec_test_until
     while True:
         with detection_lock:
             cats = len(latest_detections) > 0
         now = time.time()
 
+        # Auto-start on cat detection
         if cats:
             recording["last_detection_time"] = now
             if not recording["active"]:
-                rec_proc = start_recording()
+                start_recording()
 
+        # Feed frames to ffmpeg
         if recording["active"]:
-            # Feed latest MJPEG frame to ffmpeg stdin
             with mjpeg_lock:
                 frame_bytes = mjpeg_buffer
-            if frame_bytes and rec_proc and rec_proc.poll() is None:
+            if frame_bytes and _rec_proc and _rec_proc.poll() is None:
                 try:
-                    rec_proc.stdin.write(frame_bytes)
-                    rec_proc.stdin.flush()
+                    _rec_proc.stdin.write(frame_bytes)
+                    _rec_proc.stdin.flush()
                 except Exception:
                     pass
 
-            # Stop 10s after last detection
-            if not cats and (now - recording["last_detection_time"]) > 10:
-                stop_recording(rec_proc)
-                rec_proc = None
+            # Stop conditions: no cat for 10s (and not in test mode)
+            test_active = now < _rec_test_until
+            no_cat_timeout = not cats and (now - recording["last_detection_time"]) > 10
+            if no_cat_timeout and not test_active:
+                stop_recording()
+            # Stop test recording when timer expires
+            if test_active and now >= _rec_test_until:
+                _rec_test_until = 0.0
+                stop_recording()
 
         time.sleep(1/30)
 
@@ -1170,6 +1182,21 @@ def delete_audio(filename: str):
         path.unlink()
     return {"status":"deleted"}
 
+@app.get("/recording/test/start")
+def recording_test_start():
+    global _rec_test_until
+    _rec_test_until = time.time() + 10.0
+    if not recording["active"]:
+        start_recording()
+    return {"status":"recording","duration":10}
+
+@app.get("/recording/test/stop")
+def recording_test_stop():
+    global _rec_test_until
+    _rec_test_until = 0.0
+    stop_recording()
+    return {"status":"stopped"}
+
 @app.post("/reticle")
 async def set_reticle(request: Request):
     data = await request.json()
@@ -1397,6 +1424,13 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
           <select id="audio-files" size="4" style="width:100%;max-width:400px" onchange="selectAudioFile(this.value)"></select>
           <button class="btn r" style="padding:4px 10px;font-size:0.8em" onclick="deleteAudioFile()">✕ Delete Selected</button>
         </div>
+      </div>
+    </details>
+    <details style="margin-top:8px">
+      <summary style="cursor:pointer;color:#aaf;font-size:0.95em;margin-bottom:8px">⏺ Recording</summary>
+      <div style="padding:8px 0;display:flex;gap:10px;align-items:center">
+        <button class="btn b" id="btn-rec-test" onclick="toggleTestRec(this)">⏺ Test Recording (10s)</button>
+        <span id="rec-test-status" style="font-size:0.85em;color:#aaa"></span>
       </div>
     </details>
     <details open>
@@ -1865,6 +1899,28 @@ function initClassSelector(currentClass){
 }
 
 // ── Settings ─────────────────────────────────────────────────────────────────
+function toggleTestRec(btn){
+  if(btn.dataset.active==='1'){
+    fetch('/recording/test/stop');
+    btn.textContent='⏺ Test Recording (10s)';
+    btn.dataset.active='0';
+    btn.classList.remove('on');
+    document.getElementById('rec-test-status').textContent='';
+  } else {
+    fetch('/recording/test/start');
+    btn.textContent='⏹ Stop Recording';
+    btn.dataset.active='1';
+    btn.classList.add('on');
+    document.getElementById('rec-test-status').textContent='Recording 10s...';
+    setTimeout(()=>{
+      btn.textContent='⏺ Test Recording (10s)';
+      btn.dataset.active='0';
+      btn.classList.remove('on');
+      document.getElementById('rec-test-status').textContent='Done — check Recordings tab';
+    }, 10500);
+  }
+}
+
 function updSettings(){
   fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({
