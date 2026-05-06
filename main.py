@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
 from adafruit_servokit import ServoKit
 import cv2
@@ -33,7 +34,29 @@ ZONE_CAL_FILE  = BASE_DIR / "zone_calibration.json"
 HOME_FILE      = BASE_DIR / "home_position.json"
 SETTINGS_FILE  = BASE_DIR / "settings.json"
 CAM_FILE       = BASE_DIR / "camera_settings.json"
-RECORDINGS_DIR.mkdir(exist_ok=True)
+AUDIO_DIR.mkdir(exist_ok=True)
+AUDIO_SETTINGS_FILE = BASE_DIR / "audio_settings.json"
+
+audio_state = {
+    "enabled": False,
+    "schedule_mode": "paired",  # paired, sound_always_spray_pct, sound_always_spray_prob, spray_always_sound_pct, spray_always_sound_prob
+    "pct": 50,          # percentage for pct modes (0-100)
+    "probability": 0.5, # probability for prob modes (0-1)
+    "volume": 80,       # 0-100
+    "active_file": None,
+    "playing": False,
+}
+if AUDIO_SETTINGS_FILE.exists():
+    try:
+        audio_state.update(json.loads(AUDIO_SETTINGS_FILE.read_text()))
+    except Exception:
+        pass
+
+def save_audio_settings():
+    AUDIO_SETTINGS_FILE.write_text(json.dumps({
+        k: audio_state[k] for k in
+        ["enabled","schedule_mode","pct","probability","volume","active_file"]
+    }))
 
 RETICLE_FILE = BASE_DIR / "reticle.json"
 LOG_FILE     = BASE_DIR / "catblastor_events.log"
@@ -618,14 +641,16 @@ def recording_loop():
         cmd = [
             "ffmpeg", "-y",
             "-f", "mjpeg",
+            "-framerate", "30",
             "-i", "pipe:0",
-            "-c:v", "h264_v4l2m2m",
-            "-b:v", "2000k",
+            "-vf", "format=yuv420p",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
             "-movflags", "+faststart",
             str(fn)
         ]
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         recording["active"] = True
         log(f"REC_START {fn.name}")
         return proc
@@ -670,6 +695,83 @@ def recording_loop():
 _last_cat_seen       = time.time()
 _last_user_input_time = time.time()
 
+# ─── Audio ────────────────────────────────────────────────────────────────────
+_audio_event_active  = False  # True while current firing event should have audio
+_audio_proc          = None   # current ffplay subprocess
+
+def _audio_should_activate():
+    """Determine if audio activates for this firing event based on schedule mode."""
+    import random
+    mode = audio_state["schedule_mode"]
+    if mode == "paired":
+        return True, True   # (audio_active, spray_active)
+    elif mode == "sound_always_spray_pct":
+        return True, random.random() < audio_state["pct"] / 100
+    elif mode == "sound_always_spray_prob":
+        return True, random.random() < audio_state["probability"]
+    elif mode == "spray_always_sound_pct":
+        return random.random() < audio_state["pct"] / 100, True
+    elif mode == "spray_always_sound_prob":
+        return random.random() < audio_state["probability"], True
+    return True, True
+
+def _play_audio_file():
+    """Play audio file to completion using ffplay. Blocks until done."""
+    global _audio_proc
+    if not audio_state["active_file"]:
+        return
+    path = AUDIO_DIR / audio_state["active_file"]
+    if not path.exists():
+        return
+    vol = int(audio_state["volume"])
+    _audio_proc = subprocess.Popen(
+        ["ffplay", "-nodisp", "-autoexit", "-volume", str(vol), str(path)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    audio_state["playing"] = True
+    _audio_proc.wait()
+    audio_state["playing"] = False
+    _audio_proc = None
+
+def audio_loop():
+    global _audio_event_active
+    import random
+    prev_solenoid = False
+
+    while True:
+        time.sleep(0.05)
+        if not audio_state["enabled"] or not audio_state["active_file"]:
+            _audio_event_active = False
+            prev_solenoid = False
+            continue
+
+        solenoid_on = firing["active"]
+
+        # New firing event starting
+        if solenoid_on and not prev_solenoid:
+            audio_active, _ = _audio_should_activate()
+            _audio_event_active = audio_active
+
+        prev_solenoid = solenoid_on
+
+        if not _audio_event_active:
+            continue
+
+        # Play audio while solenoid is active (event level)
+        if solenoid_on and not audio_state["playing"]:
+            t = threading.Thread(target=_audio_loop_playback, daemon=True)
+            t.start()
+
+def _audio_loop_playback():
+    """Plays audio repeatedly while firing event active, with 1s gap between plays."""
+    global _audio_event_active
+    while _audio_event_active and firing["active"]:
+        _play_audio_file()           # plays to completion
+        time.sleep(1.0)              # 1 second silence
+        if not firing["active"]:     # check after silence
+            break
+    _audio_event_active = False
+
 def home_position_loop():
     global _last_cat_seen
     while True:
@@ -701,9 +803,12 @@ threading.Thread(target=firing_loop,         daemon=True).start()
 threading.Thread(target=targeting_loop,      daemon=True).start()
 threading.Thread(target=recording_loop,      daemon=True).start()
 threading.Thread(target=home_position_loop,  daemon=True).start()
+threading.Thread(target=audio_loop,          daemon=True).start()
 
 # ─── FastAPI ─────────────────────────────────────────────────────────────────
 app = FastAPI()
+app.mount("/recordings", StaticFiles(directory=str(RECORDINGS_DIR)), name="recordings")
+app.mount("/audio_files", StaticFiles(directory=str(AUDIO_DIR)), name="audio_files")
 
 @app.get("/stream")
 def stream():
@@ -765,6 +870,7 @@ def status():
         "reticle_x":state["reticle_x"],"reticle_y":state["reticle_y"],
         "target_class":state["target_class"],
         "confidence_threshold":state["confidence_threshold"],
+        "audio":audio_state,
     }
 
 @app.post("/settings")
@@ -1023,11 +1129,44 @@ async def rename_recording(filename: str, request: Request):
         return {"status":"renamed","name":new_name}
     return {"status":"error"}
 
-@app.api_route("/recordings/{filename}", methods=["GET","HEAD"])
-def get_recording(filename: str):
-    path = RECORDINGS_DIR / filename
-    if path.exists(): return FileResponse(str(path), media_type="video/mp4")
-    return {"error":"not found"}
+@app.get("/audio/files")
+def list_audio():
+    files = list(AUDIO_DIR.glob("*"))
+    return {"files":[f.name for f in files if f.suffix.lower() in [".mp3",".wav",".ogg",".m4a",".aac"]]}
+
+@app.post("/audio/upload")
+async def upload_audio(request: Request):
+    from fastapi import UploadFile, File
+    body = await request.body()
+    ct   = request.headers.get("content-type","")
+    # Expect multipart; simplest: read raw body and get filename from header
+    fn   = request.headers.get("x-filename","audio.mp3")
+    path = AUDIO_DIR / fn
+    path.write_bytes(body)
+    return {"status":"uploaded","filename":fn}
+
+@app.post("/audio/settings")
+async def set_audio_settings(request: Request):
+    data = await request.json()
+    for k in ["enabled","schedule_mode","pct","probability","volume","active_file"]:
+        if k in data: audio_state[k] = data[k]
+    save_audio_settings()
+    return {k:audio_state[k] for k in ["enabled","schedule_mode","pct","probability","volume","active_file"]}
+
+@app.get("/audio/preview")
+def preview_audio():
+    threading.Thread(target=_play_audio_file, daemon=True).start()
+    return {"status":"playing"}
+
+@app.delete("/audio/files/{filename}")
+def delete_audio(filename: str):
+    path = AUDIO_DIR / filename
+    if path.exists():
+        if audio_state["active_file"] == filename:
+            audio_state["active_file"] = None
+            save_audio_settings()
+        path.unlink()
+    return {"status":"deleted"}
 
 @app.post("/reticle")
 async def set_reticle(request: Request):
@@ -1220,8 +1359,44 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
     <div id="interp-debug" style="font-size:0.78em;color:#aaa;margin:6px 0;padding:6px;background:#111;border-radius:3px;line-height:1.6"></div>
   </div>
 
-  <!-- Settings inside setup for live preview -->
-  <div id="ph-settings" class="ph" style="margin-top:8px">
+    <details style="margin-top:8px">
+      <summary style="cursor:pointer;color:#aaf;font-size:0.95em;margin-bottom:8px">🔊 Audio Deterrent</summary>
+      <div class="sg" style="margin-top:8px">
+        <div class="set"><label>Enable Audio</label>
+          <input type="checkbox" id="audio-enabled" onchange="updAudio()"></div>
+        <div class="set"><label>Schedule Mode</label>
+          <select id="audio-mode" onchange="updAudioMode()">
+            <option value="paired">Sound + Spray every time</option>
+            <option value="sound_always_spray_pct">Sound always, Spray % of activations</option>
+            <option value="sound_always_spray_prob">Sound always, Spray random probability</option>
+            <option value="spray_always_sound_pct">Spray always, Sound % of activations</option>
+            <option value="spray_always_sound_prob">Spray always, Sound random probability</option>
+          </select></div>
+        <div class="set" id="audio-pct-row" style="display:none">
+          <label id="audio-pct-label">Percentage: <span class="vl" id="vl-apct">50</span>%</label>
+          <input type="range" min="0" max="100" step="5" value="50" id="audio-pct"
+                 oninput="document.getElementById('vl-apct').textContent=this.value" onchange="updAudio()">
+        </div>
+        <div class="set" id="audio-prob-row" style="display:none">
+          <label>Probability: <span class="vl" id="vl-aprob">0.5</span></label>
+          <input type="range" min="0" max="1" step="0.05" value="0.5" id="audio-prob"
+                 oninput="document.getElementById('vl-aprob').textContent=parseFloat(this.value).toFixed(2)" onchange="updAudio()">
+        </div>
+        <div class="set"><label>Volume: <span class="vl" id="vl-vol">80</span>%</label>
+          <input type="range" min="0" max="100" step="5" value="80" id="audio-vol"
+                 oninput="document.getElementById('vl-vol').textContent=this.value" onchange="updAudio()"></div>
+        <div class="set" style="flex-direction:column;align-items:flex-start;gap:8px">
+          <label>Sound File</label>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+            <input type="file" id="audio-upload" accept="audio/*" style="display:none" onchange="uploadAudio(this)">
+            <button class="btn b" style="padding:4px 10px" onclick="document.getElementById('audio-upload').click()">⬆ Upload</button>
+            <button class="btn gr" style="padding:4px 10px" onclick="previewAudio()">▶ Preview</button>
+          </div>
+          <select id="audio-files" size="4" style="width:100%;max-width:400px" onchange="selectAudioFile(this.value)"></select>
+          <button class="btn r" style="padding:4px 10px;font-size:0.8em" onclick="deleteAudioFile()">✕ Delete Selected</button>
+        </div>
+      </div>
+    </details>
     <details open>
       <summary style="cursor:pointer;color:#aaf;font-size:0.95em;margin-bottom:8px">⚙ Firing Settings</summary>
       <div class="sg" style="margin-top:8px">
