@@ -34,8 +34,10 @@ ZONE_CAL_FILE  = BASE_DIR / "zone_calibration.json"
 HOME_FILE      = BASE_DIR / "home_position.json"
 SETTINGS_FILE  = BASE_DIR / "settings.json"
 CAM_FILE       = BASE_DIR / "camera_settings.json"
-AUDIO_DIR.mkdir(exist_ok=True)
+AUDIO_DIR      = BASE_DIR / "audio"
 AUDIO_SETTINGS_FILE = BASE_DIR / "audio_settings.json"
+RECORDINGS_DIR.mkdir(exist_ok=True)
+AUDIO_DIR.mkdir(exist_ok=True)
 
 audio_state = {
     "enabled": False,
