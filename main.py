@@ -628,18 +628,23 @@ def reticle_to_bbox_dist(rx, ry, det):
     return np.sqrt(dx*dx + dy*dy)
 
 def firing_loop():
-    last_in_zone_time = 0.0   # last time a cat was seen in zone
-    zone_was_occupied = False  # for pump linger tracking
+    last_in_zone_time = 0.0
+    zone_was_occupied = False
 
     while True:
         if not state["armed"] or state["setup_phase"] is not None:
-            if not targeting_active:
+            if not targeting_active and not _manual_firing:
                 set_pump(False)
                 set_solenoid(False)
-            firing["active"] = False
+            if not _manual_firing:
+                firing["active"] = False
             last_in_zone_time = 0.0
             zone_was_occupied = False
             time.sleep(0.1); continue
+
+        # Skip entire GPIO section during manual fire
+        if _manual_firing:
+            time.sleep(0.05); continue
 
         with detection_lock:
             dets = list(latest_detections)
@@ -649,31 +654,30 @@ def firing_loop():
         any_detected = bool(dets)
         t            = select_target(dets)
 
-        # Track last time cat was in zone
         if in_zone_dets:
             last_in_zone_time = now
             zone_was_occupied = True
 
         zone_within_2s = (now - last_in_zone_time) < 2.0
 
-        # ── Pump: on while cats in zone, off 2s after zone clear ──────────────
+        # ── Pump ──────────────────────────────────────────────────────────────
         if in_zone_dets:
             set_pump(True)
         elif zone_was_occupied and zone_within_2s:
-            set_pump(True)  # linger
+            set_pump(True)
         else:
             set_pump(False)
             if not zone_within_2s:
                 zone_was_occupied = False
 
-        # ── Solenoid: all four conditions must be true simultaneously ──────────
+        # ── Solenoid ──────────────────────────────────────────────────────────
         rx = state["reticle_x"]; ry = state["reticle_y"]
         on_target = t is not None and bool(reticle_to_bbox_dist(rx, ry, t) <= state["on_target_tolerance"])
 
         solenoid_allowed = (
-            any_detected and       # cat detected anywhere in frame
-            zone_within_2s and     # cat in zone within last 2 seconds
-            on_target              # reticle within 50px of cat bbox
+            any_detected and
+            zone_within_2s and
+            on_target
         )
 
         if solenoid_allowed:
@@ -686,11 +690,10 @@ def firing_loop():
                     threading.Thread(target=_fire_burst, daemon=True).start()
                     firing["last_fire_time"] = now
         else:
-            if not firing["active"] and not _manual_firing:
+            if not firing["active"]:
                 set_solenoid(False)
 
-        if not _manual_firing:
-            firing["active"] = solenoid_allowed
+        firing["active"] = solenoid_allowed
         time.sleep(0.05)
 
 
@@ -709,7 +712,6 @@ def targeting_loop():
             set_solenoid(False); time.sleep(1.0)
             set_pump(False); time.sleep(0.5)
         else:
-            # Only touch GPIO if firing_loop isn't actively firing
             if not firing["active"] and not _manual_firing:
                 set_gpio(False, False)
             time.sleep(0.1)
