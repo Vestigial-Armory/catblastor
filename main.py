@@ -13,6 +13,7 @@ import os
 import subprocess
 import logging
 import multiprocessing as mp
+import signal
 from datetime import datetime
 from pathlib import Path
 
@@ -886,6 +887,26 @@ threading.Thread(target=targeting_loop,      daemon=True).start()
 threading.Thread(target=recording_loop,      daemon=True).start()
 threading.Thread(target=home_position_loop,  daemon=True).start()
 threading.Thread(target=audio_loop,          daemon=True).start()
+
+def cleanup_handler(sig, frame):
+    global _inf_process
+    try:
+        if _inf_process and _inf_process.is_alive():
+            _inf_process.terminate()
+            _inf_process.join(timeout=2)
+            if _inf_process.is_alive():
+                _inf_process.kill()
+    except Exception:
+        pass
+    try:
+        GPIO.cleanup()
+    except Exception:
+        pass
+    import sys
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, cleanup_handler)
+signal.signal(signal.SIGTERM, cleanup_handler)
 
 # ─── FastAPI ─────────────────────────────────────────────────────────────────
 app = FastAPI()
