@@ -889,7 +889,7 @@ threading.Thread(target=audio_loop,          daemon=True).start()
 
 # ─── FastAPI ─────────────────────────────────────────────────────────────────
 app = FastAPI()
-app.mount("/recordings", StaticFiles(directory=str(RECORDINGS_DIR)), name="recordings")
+app.mount("/rec_files", StaticFiles(directory=str(RECORDINGS_DIR)), name="recordings")
 app.mount("/audio_files", StaticFiles(directory=str(AUDIO_DIR)), name="audio_files")
 
 @app.get("/stream")
@@ -2124,13 +2124,13 @@ function loadRecs(){
         </div>
         <div style="display:flex;gap:6px;flex-wrap:wrap">
           <button class="btn b" style="padding:4px 10px;font-size:0.8em" onclick="togglePlay('${f.name}',this)">▶ Play</button>
-          <a href="/recordings/${f.name}" download><button class="btn gr" style="padding:4px 10px;font-size:0.8em">⬇ Download</button></a>
+          <a href="/rec_files/${f.name}" download><button class="btn gr" style="padding:4px 10px;font-size:0.8em">⬇ Download</button></a>
           <button class="btn y" style="padding:4px 10px;font-size:0.8em" onclick="renameRec('${f.name}')">✏ Rename</button>
           <button class="btn r" style="padding:4px 10px;font-size:0.8em" onclick="deleteRec('${f.name}')">✕ Delete</button>
         </div>
         <div id="player-${CSS.escape(f.name)}" style="display:none;width:100%">
           <video controls style="width:100%;max-width:640px;background:#000;margin-top:4px">
-            <source src="/recordings/${f.name}" type="video/mp4">
+            <source src="/rec_files/${f.name}" type="video/mp4">
           </video>
         </div>
       </div>`).join('');
