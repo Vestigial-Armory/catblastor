@@ -780,6 +780,7 @@ _last_user_input_time = time.time()
 
 # ─── Audio ────────────────────────────────────────────────────────────────────
 _audio_event_active  = False  # True while current firing event should have audio
+_manual_firing       = False  # True while manual fire sequence is running
 _audio_proc          = None   # current ffplay subprocess
 
 def _audio_should_activate():
@@ -1314,8 +1315,6 @@ async def set_reticle(request: Request):
 def fire_manual():
     threading.Thread(target=_manual_fire, daemon=True).start()
     return {"status":"fired"}
-
-_manual_firing = False  # True while manual fire sequence is running
 
 def _manual_fire():
     global _manual_firing
