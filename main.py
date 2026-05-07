@@ -249,8 +249,8 @@ def mjpeg_reader_loop():
 
 # ─── GPIO ────────────────────────────────────────────────────────────────────
 GPIO.setmode(GPIO.BCM)
-GPIO.setup(PUMP_PIN,     GPIO.OUT); GPIO.output(PUMP_PIN,     GPIO.LOW)
-GPIO.setup(SOLENOID_PIN, GPIO.OUT); GPIO.output(SOLENOID_PIN, GPIO.LOW)
+GPIO.setup(PUMP_PIN,     GPIO.OUT); set_pump(False)
+GPIO.setup(SOLENOID_PIN, GPIO.OUT); set_solenoid(False)
 
 # ─── Servo Hardware ──────────────────────────────────────────────────────────
 kit = ServoKit(channels=16)
@@ -402,6 +402,20 @@ frame_lock        = threading.Lock()
 latest_frame      = None
 latest_detections = []
 detection_lock    = threading.Lock()
+gpio_lock         = threading.Lock()  # serialises all GPIO writes
+
+def set_pump(state_val):
+    with gpio_lock:
+        GPIO.output(PUMP_PIN, GPIO.HIGH if state_val else GPIO.LOW)
+
+def set_solenoid(state_val):
+    with gpio_lock:
+        GPIO.output(SOLENOID_PIN, GPIO.HIGH if state_val else GPIO.LOW)
+
+def set_gpio(pump_val, solenoid_val):
+    with gpio_lock:
+        GPIO.output(PUMP_PIN,     GPIO.HIGH if pump_val     else GPIO.LOW)
+        GPIO.output(SOLENOID_PIN, GPIO.HIGH if solenoid_val else GPIO.LOW)
 
 # ─── Tracking & Firing ───────────────────────────────────────────────────────
 tracking = {"primary_target_id":None,"target_entry_times":{},"last_seen":{}}
@@ -619,8 +633,8 @@ def firing_loop():
     while True:
         if not state["armed"] or state["setup_phase"] is not None:
             if not targeting_active:
-                GPIO.output(PUMP_PIN,     GPIO.LOW)
-                GPIO.output(SOLENOID_PIN, GPIO.LOW)
+                set_pump(False)
+                set_solenoid(False)
             firing["active"] = False
             last_in_zone_time = 0.0
             zone_was_occupied = False
@@ -643,11 +657,11 @@ def firing_loop():
 
         # ── Pump: on while cats in zone, off 2s after zone clear ──────────────
         if in_zone_dets:
-            GPIO.output(PUMP_PIN, GPIO.HIGH)
+            set_pump(True)
         elif zone_was_occupied and zone_within_2s:
-            GPIO.output(PUMP_PIN, GPIO.HIGH)  # linger
+            set_pump(True)  # linger
         else:
-            GPIO.output(PUMP_PIN, GPIO.LOW)
+            set_pump(False)
             if not zone_within_2s:
                 zone_was_occupied = False
 
@@ -672,7 +686,7 @@ def firing_loop():
                     firing["last_fire_time"] = now
         else:
             if not firing["active"]:
-                GPIO.output(SOLENOID_PIN, GPIO.LOW)
+                set_solenoid(False)
 
         firing["active"] = solenoid_allowed
         time.sleep(0.05)
@@ -680,22 +694,22 @@ def firing_loop():
 
 def _fire_burst():
     log(f"FIRE pan={servo_angles['pan']:.1f} tilt={servo_angles['tilt']:.1f} burst={state['burst_length']}s")
-    GPIO.output(SOLENOID_PIN, GPIO.HIGH)
+    set_solenoid(True)
     time.sleep(state["burst_length"])
-    GPIO.output(SOLENOID_PIN, GPIO.LOW)
+    set_solenoid(False)
     log("FIRE_END")
 
 def targeting_loop():
     while True:
         if targeting_active:
-            GPIO.output(PUMP_PIN,GPIO.HIGH); time.sleep(0.5)
-            GPIO.output(SOLENOID_PIN,GPIO.HIGH); time.sleep(1.0)
-            GPIO.output(SOLENOID_PIN,GPIO.LOW); time.sleep(1.0)
-            GPIO.output(PUMP_PIN,GPIO.LOW); time.sleep(0.5)
+            set_pump(True); time.sleep(0.5)
+            set_solenoid(True); time.sleep(1.0)
+            set_solenoid(False); time.sleep(1.0)
+            set_pump(False); time.sleep(0.5)
         else:
             # Only touch GPIO if firing_loop isn't actively firing
             if not firing["active"]:
-                GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
+                set_gpio(False, False)
             time.sleep(0.1)
 
 _rec_proc = None
@@ -899,7 +913,7 @@ def arm():
 def disarm():
     global targeting_active
     state["armed"] = False; targeting_active = False
-    GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
+    set_gpio(False, False)
     log("DISARM")
     return {"status":"disarmed"}
 
@@ -1157,7 +1171,7 @@ def targeting_start():
 def targeting_stop():
     global targeting_active
     targeting_active = False
-    GPIO.output(PUMP_PIN,GPIO.LOW); GPIO.output(SOLENOID_PIN,GPIO.LOW)
+    set_gpio(False, False)
     return {"targeting":False}
 
 @app.get("/recordings")
@@ -1267,11 +1281,11 @@ def fire_manual():
 def _manual_fire():
     log(f"MANUAL_FIRE pan={servo_angles['pan']:.1f} tilt={servo_angles['tilt']:.1f}")
     firing["active"] = True
-    GPIO.output(PUMP_PIN,     GPIO.HIGH)
-    GPIO.output(SOLENOID_PIN, GPIO.HIGH)
+    set_pump(True)
+    set_solenoid(True)
     time.sleep(state["burst_length"])
-    GPIO.output(SOLENOID_PIN, GPIO.LOW)
-    GPIO.output(PUMP_PIN,     GPIO.LOW)
+    set_solenoid(False)
+    set_pump(False)
     firing["active"] = False
     log("MANUAL_FIRE_END")
 def get_log():
