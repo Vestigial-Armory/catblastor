@@ -12,6 +12,7 @@ import RPi.GPIO as GPIO
 import os
 import subprocess
 import logging
+import multiprocessing as mp
 from datetime import datetime
 from pathlib import Path
 
@@ -257,7 +258,7 @@ kit.servo[PAN_CH].angle  = 90
 kit.servo[TILT_CH].angle = 90
 
 # ─── YOLO ────────────────────────────────────────────────────────────────────
-model = YOLO("yolov8n_ncnn_model")
+# Model loaded in inference subprocess — not needed in main process
 
 # ─── App State ───────────────────────────────────────────────────────────────
 state = {
@@ -429,31 +430,88 @@ def capture_loop():
                 pass
         time.sleep(1/10)
 
+def _inference_worker(frame_queue, result_queue, model_path, infer_w, infer_h, frame_w, frame_h):
+    """Runs in a separate process — has its own GIL, doesn't block main process."""
+    from ultralytics import YOLO
+    import numpy as np
+    model = YOLO(model_path)
+    while True:
+        try:
+            item = frame_queue.get(timeout=1.0)
+        except Exception:
+            continue
+        if item is None:
+            break
+        frame, target_class, confidence_threshold = item
+        try:
+            results = model(frame, verbose=False)
+            sx, sy  = frame_w / infer_w, frame_h / infer_h
+            dets = []
+            for r in results[0].boxes:
+                cls  = int(r.cls); conf = float(r.conf)
+                if cls == target_class and conf >= confidence_threshold:
+                    x1,y1,x2,y2 = map(int, r.xyxy[0])
+                    x1,y1,x2,y2 = int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy)
+                    cx,cy = (x1+x2)//2,(y1+y2)//2
+                    dets.append({"id":f"{cx}_{cy}","x1":x1,"y1":y1,"x2":x2,"y2":y2,
+                                 "cx":cx,"cy":cy,"conf":conf,"in_zone":False})
+            result_queue.put(dets)
+        except Exception as e:
+            result_queue.put([])
+
+# Set up inference queues and process
+_inf_frame_q  = mp.Queue(maxsize=1)
+_inf_result_q = mp.Queue(maxsize=4)
+_inf_process  = None
+
+def start_inference_process():
+    global _inf_process
+    _inf_process = mp.Process(
+        target=_inference_worker,
+        args=(_inf_frame_q, _inf_result_q,
+              "yolov8n_ncnn_model", INFER_W, INFER_H, FRAME_W, FRAME_H),
+        daemon=True
+    )
+    _inf_process.start()
+
 def inference_loop():
     global latest_detections, inference_seq
     while True:
         if not state["armed"]:
-            latest_detections = []; time.sleep(0.1); continue
+            latest_detections = []
+            time.sleep(0.1); continue
+
         with frame_lock:
-            if latest_frame is None: time.sleep(0.05); continue
+            if latest_frame is None:
+                time.sleep(0.05); continue
             frame = latest_frame.copy()
-        # Snapshot servo angles at the exact moment inference ran
-        results = model(frame, verbose=False)
-        sx, sy = FRAME_W/INFER_W, FRAME_H/INFER_H
+
+        # Send frame to inference process (drop if busy)
+        try:
+            _inf_frame_q.put_nowait(
+                (frame, state["target_class"], state["confidence_threshold"])
+            )
+        except Exception:
+            pass  # queue full, skip frame
+
+        # Wait for result (blocking — but in this thread only)
+        try:
+            raw_dets = _inf_result_q.get(timeout=2.0)
+        except Exception:
+            continue
+
+        # Apply zone check in main process (has access to zone state)
         dets = []
-        for r in results[0].boxes:
-            cls = int(r.cls); conf = float(r.conf)
-            if cls == state["target_class"] and conf >= state["confidence_threshold"]:
-                x1,y1,x2,y2 = map(int, r.xyxy[0])
-                x1,y1,x2,y2 = int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy)
-                cx,cy = (x1+x2)//2,(y1+y2)//2
-                dets.append({"id":f"{cx}_{cy}","x1":x1,"y1":y1,"x2":x2,"y2":y2,
-                             "cx":cx,"cy":cy,"conf":conf,"in_zone":point_in_zone(cx,cy)})
+        for d in raw_dets:
+            d["in_zone"] = bool(point_in_zone(d["cx"], d["cy"]))
+            dets.append(d)
+
         with detection_lock:
             prev_in_zone = {d["id"] for d in latest_detections if d["in_zone"]}
             prev_ids     = {d["id"] for d in latest_detections}
             latest_detections = dets
             inference_seq += 1
+
         new_ids     = {d["id"] for d in dets}
         new_in_zone = {d["id"] for d in dets if d["in_zone"]}
         for d in dets:
@@ -804,6 +862,7 @@ def home_position_loop():
 
 # ─── Start Threads ───────────────────────────────────────────────────────────
 threading.Thread(target=start_streaming,     daemon=True).start()
+start_inference_process()
 threading.Thread(target=mjpeg_reader_loop,   daemon=True).start()
 threading.Thread(target=capture_loop,        daemon=True).start()
 threading.Thread(target=inference_loop,      daemon=True).start()
