@@ -686,10 +686,11 @@ def firing_loop():
                     threading.Thread(target=_fire_burst, daemon=True).start()
                     firing["last_fire_time"] = now
         else:
-            if not firing["active"]:
+            if not firing["active"] and not _manual_firing:
                 set_solenoid(False)
 
-        firing["active"] = solenoid_allowed
+        if not _manual_firing:
+            firing["active"] = solenoid_allowed
         time.sleep(0.05)
 
 
@@ -709,7 +710,7 @@ def targeting_loop():
             set_pump(False); time.sleep(0.5)
         else:
             # Only touch GPIO if firing_loop isn't actively firing
-            if not firing["active"]:
+            if not firing["active"] and not _manual_firing:
                 set_gpio(False, False)
             time.sleep(0.1)
 
@@ -798,18 +799,32 @@ def _audio_should_activate():
     return True, True
 
 def _play_audio_file():
-    """Play audio file to completion using ffplay. Blocks until done."""
+    """Play audio file to completion. Blocks until done."""
     global _audio_proc
     if not audio_state["active_file"]:
         return
     path = AUDIO_DIR / audio_state["active_file"]
     if not path.exists():
         return
-    vol = int(audio_state["volume"])
-    _audio_proc = subprocess.Popen(
-        ["ffplay", "-nodisp", "-autoexit", "-volume", str(vol), str(path)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+    vol  = int(audio_state["volume"])
+    ext  = path.suffix.lower()
+    # Try ffplay first, fall back to aplay (wav) or mpg123 (mp3)
+    try:
+        _audio_proc = subprocess.Popen(
+            ["ffplay", "-nodisp", "-autoexit", "-volume", str(vol), str(path)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except FileNotFoundError:
+        if ext == ".wav":
+            _audio_proc = subprocess.Popen(
+                ["aplay", str(path)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        else:
+            _audio_proc = subprocess.Popen(
+                ["mpg123", "-q", str(path)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
     audio_state["playing"] = True
     _audio_proc.wait()
     audio_state["playing"] = False
@@ -1300,8 +1315,12 @@ def fire_manual():
     threading.Thread(target=_manual_fire, daemon=True).start()
     return {"status":"fired"}
 
+_manual_firing = False  # True while manual fire sequence is running
+
 def _manual_fire():
+    global _manual_firing
     log(f"MANUAL_FIRE pan={servo_angles['pan']:.1f} tilt={servo_angles['tilt']:.1f}")
+    _manual_firing = True
     firing["active"] = True
     set_pump(True)
     time.sleep(0.5)
@@ -1311,6 +1330,7 @@ def _manual_fire():
     time.sleep(0.5)
     set_pump(False)
     firing["active"] = False
+    _manual_firing = False
     log("MANUAL_FIRE_END")
 def get_log():
     if LOG_FILE.exists():
