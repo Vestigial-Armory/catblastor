@@ -232,9 +232,17 @@ def mjpeg_reader_loop():
             while True:
                 s = buf.find(SOI); e = buf.find(EOI, s+2)
                 if s == -1 or e == -1: break
+                frame = buf[s:e+2]
                 with mjpeg_lock:
-                    mjpeg_buffer = buf[s:e+2]
+                    mjpeg_buffer = frame
                 buf = buf[e+2:]
+                # Write directly to recording process for true framerate
+                if recording["active"] and _rec_proc and _rec_proc.poll() is None:
+                    try:
+                        _rec_proc.stdin.write(frame)
+                        _rec_proc.stdin.flush()
+                    except Exception:
+                        pass
         except Exception as ex:
             print(f"MJPEG reader: {ex}"); time.sleep(0.1)
 
@@ -670,41 +678,28 @@ def stop_recording():
     log("REC_STOP")
 
 def recording_loop():
-    """Records directly from MJPEG stream via ffmpeg — true 30fps, faststart for browser playback."""
+    """Manages recording start/stop. Frame feeding handled by mjpeg_reader_loop."""
     global _rec_test_until
     while True:
         with detection_lock:
             cats = len(latest_detections) > 0
         now = time.time()
 
-        # Auto-start on cat detection
         if cats:
             recording["last_detection_time"] = now
             if not recording["active"]:
                 start_recording()
 
-        # Feed frames to ffmpeg
         if recording["active"]:
-            with mjpeg_lock:
-                frame_bytes = mjpeg_buffer
-            if frame_bytes and _rec_proc and _rec_proc.poll() is None:
-                try:
-                    _rec_proc.stdin.write(frame_bytes)
-                    _rec_proc.stdin.flush()
-                except Exception:
-                    pass
-
-            # Stop conditions: no cat for 10s (and not in test mode)
-            test_active = now < _rec_test_until
+            test_active   = now < _rec_test_until
             no_cat_timeout = not cats and (now - recording["last_detection_time"]) > 10
             if no_cat_timeout and not test_active:
                 stop_recording()
-            # Stop test recording when timer expires
-            if test_active and now >= _rec_test_until:
+            if _rec_test_until > 0 and now >= _rec_test_until:
                 _rec_test_until = 0.0
                 stop_recording()
 
-        time.sleep(1/30)
+        time.sleep(0.5)
 
 _last_cat_seen       = time.time()
 _last_user_input_time = time.time()
