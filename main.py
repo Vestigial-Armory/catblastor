@@ -1212,11 +1212,13 @@ def fire_manual():
 
 def _manual_fire():
     log(f"MANUAL_FIRE pan={servo_angles['pan']:.1f} tilt={servo_angles['tilt']:.1f}")
+    firing["active"] = True
     GPIO.output(PUMP_PIN,     GPIO.HIGH)
     GPIO.output(SOLENOID_PIN, GPIO.HIGH)
     time.sleep(state["burst_length"])
     GPIO.output(SOLENOID_PIN, GPIO.LOW)
     GPIO.output(PUMP_PIN,     GPIO.LOW)
+    firing["active"] = False
     log("MANUAL_FIRE_END")
 def get_log():
     if LOG_FILE.exists():
