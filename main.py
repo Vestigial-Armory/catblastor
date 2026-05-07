@@ -888,25 +888,26 @@ threading.Thread(target=recording_loop,      daemon=True).start()
 threading.Thread(target=home_position_loop,  daemon=True).start()
 threading.Thread(target=audio_loop,          daemon=True).start()
 
-def cleanup_handler(sig, frame):
+import atexit
+
+def _cleanup():
     global _inf_process
     try:
         if _inf_process and _inf_process.is_alive():
+            _inf_frame_q.put_nowait(None)  # signal worker to exit
             _inf_process.terminate()
-            _inf_process.join(timeout=2)
+            _inf_process.join(timeout=3)
             if _inf_process.is_alive():
                 _inf_process.kill()
     except Exception:
         pass
     try:
+        set_gpio(False, False)
         GPIO.cleanup()
     except Exception:
         pass
-    import sys
-    sys.exit(0)
 
-signal.signal(signal.SIGINT, cleanup_handler)
-signal.signal(signal.SIGTERM, cleanup_handler)
+atexit.register(_cleanup)
 
 # ─── FastAPI ─────────────────────────────────────────────────────────────────
 app = FastAPI()
