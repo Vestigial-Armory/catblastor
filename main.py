@@ -668,7 +668,7 @@ def firing_loop():
 
         # ── Solenoid: all four conditions must be true simultaneously ──────────
         rx = state["reticle_x"]; ry = state["reticle_y"]
-        on_target = t is not None and bool(reticle_to_bbox_dist(rx, ry, t) <= 50)
+        on_target = t is not None and bool(reticle_to_bbox_dist(rx, ry, t) <= state["on_target_tolerance"])
 
         solenoid_allowed = (
             any_detected and       # cat detected anywhere in frame
@@ -1303,9 +1303,11 @@ def _manual_fire():
     log(f"MANUAL_FIRE pan={servo_angles['pan']:.1f} tilt={servo_angles['tilt']:.1f}")
     firing["active"] = True
     set_pump(True)
+    time.sleep(0.5)
     set_solenoid(True)
-    time.sleep(state["burst_length"])
+    time.sleep(1.0)
     set_solenoid(False)
+    time.sleep(0.5)
     set_pump(False)
     firing["active"] = False
     log("MANUAL_FIRE_END")
@@ -1432,6 +1434,7 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
         <button class="btn gr" onclick="mv(-5,0)">◀</button>
         <button class="btn gr" onclick="mv(5,0)">▶</button>
         <button class="btn gr" onclick="fetch('/servos/home/go')">🏠 Go Home</button>
+      <button class="btn b" onclick="fetch('/fire/manual')" style="background:#1a6fc4">💧 Fire</button>
       </div>
     </div>
     <div style="min-width:220px;max-width:260px">
@@ -1566,6 +1569,10 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
         <div class="set"><label>Tolerance (px): <span class="vl" id="vl-t">20</span></label>
           <input type="range" min="5" max="100" step="5" value="20" id="on_target_tolerance"
                  oninput="document.getElementById('vl-t').textContent=this.value" onchange="updSettings()"></div>
+        <div style="margin-top:10px;display:flex;align-items:center;gap:12px">
+          <button class="btn g" onclick="saveSettings()">💾 Save Settings</button>
+          <span id="settings-saved-msg" style="color:#4f4;font-size:0.85em;opacity:0;transition:opacity 0.5s">✓ Settings saved</span>
+        </div>
       </div>
     </details>
     <details style="margin-top:8px">
@@ -1648,6 +1655,7 @@ function showPage(page, btn) {
   curPage = page;
   if(page==='recordings') loadRecs();
   if(page==='setup'){
+    loadAudioFiles();
     // When entering setup, always get current state and sync verts from server
     fetch('/setup/start').then(r=>r.json()).then(d=>{
       applyPhase(d.phase);
@@ -1982,6 +1990,81 @@ const COCO_CLASSES = [
 ];
 
 let _classSelInited = false;
+// ── Audio ─────────────────────────────────────────────────────────────────────
+function loadAudioFiles(){
+  fetch('/audio/files').then(r=>r.json()).then(d=>{
+    const sel = document.getElementById('audio-files');
+    if(!sel) return;
+    const cur = sel.value;
+    sel.innerHTML = d.files.length
+      ? d.files.map(f=>`<option value="${f}"${f===cur?' selected':''}>${f}</option>`).join('')
+      : '<option disabled>No files uploaded</option>';
+  });
+}
+
+function uploadAudio(input){
+  const file = input.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    fetch('/audio/upload', {
+      method:'POST',
+      headers:{'Content-Type':'application/octet-stream','x-filename':file.name},
+      body: e.target.result
+    }).then(()=>{ loadAudioFiles(); input.value=''; });
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function selectAudioFile(name){
+  fetch('/audio/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({active_file:name})});
+}
+
+function previewAudio(){
+  const sel = document.getElementById('audio-files');
+  if(sel && sel.value) {
+    fetch('/audio/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({active_file:sel.value})}).then(()=>fetch('/audio/preview'));
+  } else {
+    fetch('/audio/preview');
+  }
+}
+
+function deleteAudioFile(){
+  const sel = document.getElementById('audio-files');
+  if(!sel || !sel.value) return;
+  if(!confirm(`Delete ${sel.value}?`)) return;
+  fetch('/audio/files/'+encodeURIComponent(sel.value),{method:'DELETE'})
+    .then(()=>loadAudioFiles());
+}
+
+function updAudioMode(){
+  const mode = document.getElementById('audio-mode').value;
+  const pctRow  = document.getElementById('audio-pct-row');
+  const probRow = document.getElementById('audio-prob-row');
+  const lbl     = document.getElementById('audio-pct-label');
+  pctRow.style.display  = mode.endsWith('_pct')  ? 'flex' : 'none';
+  probRow.style.display = mode.endsWith('_prob') ? 'flex' : 'none';
+  if(lbl){
+    lbl.innerHTML = mode.startsWith('sound') 
+      ? 'Spray %: <span class="vl" id="vl-apct">50</span>%'
+      : 'Sound %: <span class="vl" id="vl-apct">50</span>%';
+  }
+  updAudio();
+}
+
+function updAudio(){
+  fetch('/audio/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      enabled:document.getElementById('audio-enabled').checked,
+      schedule_mode:document.getElementById('audio-mode').value,
+      pct:parseInt(document.getElementById('audio-pct').value),
+      probability:parseFloat(document.getElementById('audio-prob').value),
+      volume:parseInt(document.getElementById('audio-vol').value),
+    })});
+}
+
 function filterClasses(q){
   const sel = document.getElementById('target_class');
   if(!sel) return;
@@ -2023,6 +2106,23 @@ function toggleTestRec(btn){
       document.getElementById('rec-test-status').textContent='Done — check Recordings tab';
     }, 10500);
   }
+}
+
+function saveSettings(){
+  fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      firing_mode:document.getElementById('firing_mode').value,
+      burst_length:parseFloat(document.getElementById('burst_length').value),
+      reload_time:parseFloat(document.getElementById('reload_time').value),
+      semi_auto_delay:parseFloat(document.getElementById('semi_auto_delay').value),
+      confidence_threshold:parseFloat(document.getElementById('confidence_threshold').value),
+      on_target_tolerance:parseInt(document.getElementById('on_target_tolerance').value),
+      target_class:parseInt(document.getElementById('target_class').value)||15,
+    })}).then(r=>r.json()).then(d=>{
+      const msg = document.getElementById('settings-saved-msg');
+      msg.style.opacity='1';
+      setTimeout(()=>{ msg.style.opacity='0'; }, 2500);
+    });
 }
 
 function updSettings(){
