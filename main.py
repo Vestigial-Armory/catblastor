@@ -405,15 +405,20 @@ latest_detections = []
 detection_lock    = threading.Lock()
 gpio_lock         = threading.Lock()  # serialises all GPIO writes
 
+_shutting_down = False
+
 def set_pump(state_val):
+    if _shutting_down: return
     with gpio_lock:
         GPIO.output(PUMP_PIN, GPIO.HIGH if state_val else GPIO.LOW)
 
 def set_solenoid(state_val):
+    if _shutting_down: return
     with gpio_lock:
         GPIO.output(SOLENOID_PIN, GPIO.HIGH if state_val else GPIO.LOW)
 
 def set_gpio(pump_val, solenoid_val):
+    if _shutting_down: return
     with gpio_lock:
         GPIO.output(PUMP_PIN,     GPIO.HIGH if pump_val     else GPIO.LOW)
         GPIO.output(SOLENOID_PIN, GPIO.HIGH if solenoid_val else GPIO.LOW)
@@ -909,10 +914,12 @@ threading.Thread(target=audio_loop,          daemon=True).start()
 import atexit
 
 def _cleanup():
-    global _inf_process
+    global _inf_process, _shutting_down
+    _shutting_down = True
+    time.sleep(0.2)  # let threads see the flag and exit GPIO calls
     try:
         if _inf_process and _inf_process.is_alive():
-            _inf_frame_q.put_nowait(None)  # signal worker to exit
+            _inf_frame_q.put_nowait(None)
             _inf_process.terminate()
             _inf_process.join(timeout=3)
             if _inf_process.is_alive():
@@ -920,7 +927,9 @@ def _cleanup():
     except Exception:
         pass
     try:
-        set_gpio(False, False)
+        with gpio_lock:
+            GPIO.output(PUMP_PIN,     GPIO.LOW)
+            GPIO.output(SOLENOID_PIN, GPIO.LOW)
         GPIO.cleanup()
     except Exception:
         pass
