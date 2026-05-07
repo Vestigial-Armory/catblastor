@@ -249,8 +249,8 @@ def mjpeg_reader_loop():
 
 # ─── GPIO ────────────────────────────────────────────────────────────────────
 GPIO.setmode(GPIO.BCM)
-GPIO.setup(PUMP_PIN,     GPIO.OUT); set_pump(False)
-GPIO.setup(SOLENOID_PIN, GPIO.OUT); set_solenoid(False)
+GPIO.setup(PUMP_PIN,     GPIO.OUT); GPIO.output(PUMP_PIN,     GPIO.LOW)
+GPIO.setup(SOLENOID_PIN, GPIO.OUT); GPIO.output(SOLENOID_PIN, GPIO.LOW)
 
 # ─── Servo Hardware ──────────────────────────────────────────────────────────
 kit = ServoKit(channels=16)
