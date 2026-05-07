@@ -1205,7 +1205,19 @@ async def set_reticle(request: Request):
     RETICLE_FILE.write_text(json.dumps({"x":state["reticle_x"],"y":state["reticle_y"]}))
     return {"reticle_x":state["reticle_x"],"reticle_y":state["reticle_y"]}
 
-@app.get("/log")
+@app.get("/fire/manual")
+def fire_manual():
+    threading.Thread(target=_manual_fire, daemon=True).start()
+    return {"status":"fired"}
+
+def _manual_fire():
+    log(f"MANUAL_FIRE pan={servo_angles['pan']:.1f} tilt={servo_angles['tilt']:.1f}")
+    GPIO.output(PUMP_PIN,     GPIO.HIGH)
+    GPIO.output(SOLENOID_PIN, GPIO.HIGH)
+    time.sleep(state["burst_length"])
+    GPIO.output(SOLENOID_PIN, GPIO.LOW)
+    GPIO.output(PUMP_PIN,     GPIO.LOW)
+    log("MANUAL_FIRE_END")
 def get_log():
     if LOG_FILE.exists():
         return FileResponse(str(LOG_FILE), media_type="text/plain", filename="catblastor_events.log")
@@ -1295,6 +1307,7 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
     <button class="btn gr" onclick="fetch('/servos/center')">Center</button>
     <button class="btn gr" onclick="fetch('/servos/home/go')">🏠 Home</button>
     <button class="btn gr" onclick="fetch('/servos/home/set')">📌 Set Home</button>
+    <button class="btn b" onclick="fetch('/fire/manual')" style="background:#1a6fc4">💧 Fire</button>
   </div>
   <div class="ctrl">
     <span style="color:#aaa;font-size:0.85em">Pan/Tilt:</span>
