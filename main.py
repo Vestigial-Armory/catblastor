@@ -977,14 +977,14 @@ def stream():
     return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 @app.get("/arm")
-def arm():
+async def arm():
     state["armed"] = True
     dbg(f"ARM pan={servo_angles['pan']:.1f} tilt={servo_angles['tilt']:.1f}")
     log(f"ARM pan={servo_angles['pan']:.1f} tilt={servo_angles['tilt']:.1f}")
     return {"status":"armed"}
 
 @app.get("/disarm")
-def disarm():
+async def disarm():
     global targeting_active, _patrol_active
     dbg(f"DISARM patrol_was={_patrol_active}")
     state["armed"] = False
@@ -997,7 +997,8 @@ def disarm():
     return {"status":"disarmed"}
 
 @app.get("/status")
-def status():
+async def status():
+    """Lightweight fast status — called every 100ms. No heavy calibration computation."""
     with detection_lock:
         cats = len(latest_detections)
         in_z = len([d for d in latest_detections if d["in_zone"]])
@@ -1006,11 +1007,6 @@ def status():
                  "is_primary":d["id"]==tracking["primary_target_id"]}
                 for d in latest_detections]
     zone_px, z_closed = get_live_zone()
-    setup_verts, setup_closed, is_exact = get_setup_zone()
-    strength = compute_calibration_strength()
-    gp = grid_snap(servo_angles["pan"])
-    gt = grid_snap(servo_angles["tilt"])
-    n_total = int(((PAN_MAX-PAN_MIN)/GRID_STEP+1)*((TILT_MAX-TILT_MIN)/GRID_STEP+1))
     return {
         "armed":state["armed"],"setup_phase":state["setup_phase"],
         "cats_detected":cats,"cats_in_zone":in_z,
@@ -1019,26 +1015,37 @@ def status():
         "pan":round(servo_angles["pan"],1),"tilt":round(servo_angles["tilt"],1),
         "pan_pct":servo_pct(servo_angles["pan"],PAN_CENTER,PAN_RANGE),
         "tilt_pct":servo_pct(servo_angles["tilt"],TILT_CENTER,TILT_RANGE),
-        "grid_pan":gp,"grid_tilt":gt,
-        "grid_pan_pct":round(servo_pct(gp,PAN_CENTER,PAN_RANGE),1),
-        "grid_tilt_pct":round(servo_pct(gt,TILT_CENTER,TILT_RANGE),1),
         "detections":dets,"zone_px":zone_px,"zone_closed":z_closed,
-        "setup_zone":setup_verts,"setup_zone_closed":setup_closed,"setup_zone_exact":is_exact,
-        "n_cal_points":len(zone_cal["calibration_points"]),
-        "n_total_positions":n_total,
-        "strength":strength,
-        "cam":cam_settings,"depth_m":zone_cal["depth_m"],
         "reticle_x":state["reticle_x"],"reticle_y":state["reticle_y"],
-        "target_class":state["target_class"],
-        "confidence_threshold":state["confidence_threshold"],
+        "on_target_tolerance":state["on_target_tolerance"],
+        "patrol_active":_patrol_active,
+        "test_firing":_test_firing,
         "firing_mode":state["firing_mode"],
         "burst_length":state["burst_length"],
         "reload_time":state["reload_time"],
         "semi_auto_delay":state["semi_auto_delay"],
-        "on_target_tolerance":state["on_target_tolerance"],
         "patrol_step_interval":state["patrol_step_interval"],
-        "patrol_active":_patrol_active,
-        "test_firing":_test_firing,
+    }
+
+@app.get("/setup_status")
+async def setup_status():
+    """Heavy setup status — only called when on Setup tab (~500ms)."""
+    setup_verts, setup_closed, is_exact = get_setup_zone()
+    strength = compute_calibration_strength()
+    gp = grid_snap(servo_angles["pan"])
+    gt = grid_snap(servo_angles["tilt"])
+    n_total = int(((PAN_MAX-PAN_MIN)/GRID_STEP+1)*((TILT_MAX-TILT_MIN)/GRID_STEP+1))
+    return {
+        "setup_zone":setup_verts,"setup_zone_closed":setup_closed,"setup_zone_exact":is_exact,
+        "n_cal_points":len(zone_cal["calibration_points"]),
+        "n_total_positions":n_total,
+        "strength":strength,
+        "grid_pan":gp,"grid_tilt":gt,
+        "grid_pan_pct":round(servo_pct(gp,PAN_CENTER,PAN_RANGE),1),
+        "grid_tilt_pct":round(servo_pct(gt,TILT_CENTER,TILT_RANGE),1),
+        "cam":cam_settings,"depth_m":zone_cal["depth_m"],
+        "target_class":state["target_class"],
+        "confidence_threshold":state["confidence_threshold"],
         "audio":audio_state,
     }
 
@@ -1426,14 +1433,14 @@ def _do_test_burst():
     _manual_firing = False
 
 @app.get("/patrol/start")
-def patrol_start():
+async def patrol_start():
     global _patrol_active
     _patrol_active = True
     dbg(f"PATROL_START armed={state['armed']} pan={servo_angles['pan']:.1f} tilt={servo_angles['tilt']:.1f}")
     return {"status":"patrol_active"}
 
 @app.get("/patrol/stop")
-def patrol_stop():
+async def patrol_stop():
     global _patrol_active
     _patrol_active = False
     dbg(f"PATROL_STOP armed={state['armed']}")
@@ -1518,7 +1525,7 @@ def fire_test_start_ep():
     return {"status":"test_firing"}
 
 @app.get("/fire/manual")
-def fire_manual():
+async def fire_manual():
     threading.Thread(target=_manual_fire, daemon=True).start()
     return {"status":"fired"}
 
@@ -2606,7 +2613,17 @@ let _slowTick = 0;
 setInterval(()=>{
   fetch('/status').then(r=>r.json()).then(d=>{
     fastPoll(d);
-    if(++_slowTick >= 5){ _slowTick=0; slowPoll(d); }
+    if(++_slowTick >= 5){
+      _slowTick = 0;
+      // Only fetch heavy setup_status when needed
+      if(curPage === 'setup' || !camInit){
+        fetch('/setup_status').then(r=>r.json()).then(sd=>{
+          slowPoll(Object.assign({}, d, sd));
+        });
+      } else {
+        slowPoll(d);
+      }
+    }
   });
 }, 100);
 
