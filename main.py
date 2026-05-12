@@ -1447,9 +1447,12 @@ def patrol_loop():
 
         # Initialize at current position on first activation
         if pan is None:
-            pan      = servo_angles["pan"]
-            tilt     = servo_angles["tilt"]
-            pan_dir  = -1
+            pan       = servo_angles["pan"]
+            tilt      = home_position["tilt"]
+            # Start moving toward whichever side has more room
+            pan_min_t = max(PAN_MIN, home_position["pan"] - PAN_RANGE * 0.8)
+            pan_max_t = min(PAN_MAX, home_position["pan"] + PAN_RANGE * 0.8)
+            pan_dir   = -1 if (pan - pan_min_t) > (pan_max_t - pan) else 1
             tilt_step = 0
             last_step = now
             continue
@@ -1778,7 +1781,7 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
                  oninput="document.getElementById('vl-s').textContent=parseFloat(this.value).toFixed(1)" onchange="updSettings()"></div>
         <div class="set"><label>Tolerance (px): <span class="vl" id="vl-t">20</span></label>
           <input type="range" min="5" max="100" step="5" value="20" id="on_target_tolerance"
-                 oninput="document.getElementById('vl-t').textContent=this.value" onchange="updSettings()"></div>
+                 oninput="document.getElementById('vl-t').textContent=this.value;lastStatus.on_target_tolerance=parseInt(this.value)"></div>
         <div class="set"><label>Patrol Step (s): <span class="vl" id="vl-p">5</span></label>
           <input type="range" min="1" max="60" step="1" value="5" id="patrol_step_interval"
                  oninput="document.getElementById('vl-p').textContent=this.value" onchange="updSettings()"></div>
