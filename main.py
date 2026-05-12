@@ -1003,6 +1003,7 @@ async def status():
         cats = len(latest_detections)
         in_z = len([d for d in latest_detections if d["in_zone"]])
         dets = [{"x1":d["x1"],"y1":d["y1"],"x2":d["x2"],"y2":d["y2"],
+                 "cx":d["cx"],"cy":d["cy"],
                  "conf":round(d["conf"],2),"in_zone":d["in_zone"],
                  "is_primary":d["id"]==tracking["primary_target_id"]}
                 for d in latest_detections]
@@ -2218,6 +2219,12 @@ function drawOvs(d){
       ctx.strokeRect(det.x1,det.y1,det.x2-det.x1,det.y2-det.y1);
       ctx.fillStyle=col;ctx.font='12px sans-serif';
       ctx.fillText('CAT'+(det.is_primary?' [TGT]':'')+' '+det.conf,det.x1,det.y1-4);
+      // Yellow hollow square at cat centroid (20x20px)
+      if(det.cx !== undefined && det.cy !== undefined){
+        ctx.strokeStyle='#ffff00';ctx.lineWidth=2;
+        ctx.setLineDash([]);
+        ctx.strokeRect(det.cx-10,det.cy-10,20,20);
+      }
     });
 
     // Reticle
