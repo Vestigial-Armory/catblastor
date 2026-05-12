@@ -921,7 +921,7 @@ import atexit
 def _cleanup():
     global _inf_process, _shutting_down
     _shutting_down = True
-    time.sleep(0.2)  # let threads see the flag and exit GPIO calls
+    time.sleep(0.2)
     try:
         if _inf_process and _inf_process.is_alive():
             _inf_frame_q.put_nowait(None)
@@ -936,6 +936,11 @@ def _cleanup():
             GPIO.output(PUMP_PIN,     GPIO.LOW)
             GPIO.output(SOLENOID_PIN, GPIO.LOW)
         GPIO.cleanup()
+    except Exception:
+        pass
+    try:
+        import os, signal
+        os.killpg(os.getpgid(os.getpid()), signal.SIGKILL)
     except Exception:
         pass
 
