@@ -64,11 +64,21 @@ def save_audio_settings():
 
 RETICLE_FILE = BASE_DIR / "reticle.json"
 LOG_FILE     = BASE_DIR / "catblastor_events.log"
+DEBUG_FILE   = BASE_DIR / "catblastor_debug.log"
 _log_handler = logging.FileHandler(str(LOG_FILE))
 _log_handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 _logger = logging.getLogger("cb")
 _logger.setLevel(logging.DEBUG)
 _logger.addHandler(_log_handler)
+
+_dbg_handler = logging.FileHandler(str(DEBUG_FILE))
+_dbg_handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+_dbg_logger = logging.getLogger("cb_debug")
+_dbg_logger.setLevel(logging.DEBUG)
+_dbg_logger.addHandler(_dbg_handler)
+
+def dbg(msg):
+    _dbg_logger.info(msg)
 
 def log(msg):
     _logger.info(msg)
@@ -969,12 +979,14 @@ def stream():
 @app.get("/arm")
 def arm():
     state["armed"] = True
+    dbg(f"ARM pan={servo_angles['pan']:.1f} tilt={servo_angles['tilt']:.1f}")
     log(f"ARM pan={servo_angles['pan']:.1f} tilt={servo_angles['tilt']:.1f}")
     return {"status":"armed"}
 
 @app.get("/disarm")
 def disarm():
     global targeting_active, _patrol_active
+    dbg(f"DISARM patrol_was={_patrol_active}")
     state["armed"] = False
     targeting_active = False
     if _patrol_active:
@@ -1033,10 +1045,13 @@ def status():
 @app.post("/settings")
 async def update_settings(request: Request):
     data = await request.json()
-    for k in ["firing_mode","burst_length","reload_time","semi_auto_delay",
-               "confidence_threshold","on_target_tolerance","target_class",
-               "patrol_step_interval"]:
+    old = {k:state[k] for k in ["firing_mode","burst_length","reload_time","semi_auto_delay",
+               "confidence_threshold","on_target_tolerance","target_class","patrol_step_interval"]}
+    for k in old:
         if k in data: state[k] = data[k]
+    changed = {k:f"{old[k]}->{state[k]}" for k in old if old[k] != state[k]}
+    if changed:
+        dbg(f"SETTINGS_CHANGED {changed} patrol_active={_patrol_active} armed={state['armed']}")
     save_settings(); return {"status":"updated"}
 
 @app.post("/camera")
@@ -1414,12 +1429,14 @@ def _do_test_burst():
 def patrol_start():
     global _patrol_active
     _patrol_active = True
+    dbg(f"PATROL_START armed={state['armed']} pan={servo_angles['pan']:.1f} tilt={servo_angles['tilt']:.1f}")
     return {"status":"patrol_active"}
 
 @app.get("/patrol/stop")
 def patrol_stop():
     global _patrol_active
     _patrol_active = False
+    dbg(f"PATROL_STOP armed={state['armed']}")
     return {"status":"patrol_stopped"}
 
 def patrol_loop():
@@ -1435,12 +1452,13 @@ def patrol_loop():
         time.sleep(0.1)
 
         if not _patrol_active or not state["armed"] or state["setup_phase"] is not None:
+            if pan is not None:
+                dbg(f"PATROL_STOP reason=patrol_active:{_patrol_active} armed:{state['armed']} setup:{state['setup_phase']}")
             pan  = None
             tilt = None
             last_step = 0.0
             continue
 
-        # Pause patrol while cat detected
         with detection_lock:
             cats = len(latest_detections) > 0
         if cats:
@@ -1449,50 +1467,45 @@ def patrol_loop():
 
         now      = time.time()
         interval = state["patrol_step_interval"]
+        elapsed  = now - last_step
+
         if now - last_step < interval:
             continue
 
-        # Initialize at current position on first activation
         if pan is None:
             pan       = servo_angles["pan"]
             tilt      = home_position["tilt"]
-            # Start moving toward whichever side has more room
             pan_min_t = max(PAN_MIN, home_position["pan"] - PAN_RANGE * 0.8)
             pan_max_t = min(PAN_MAX, home_position["pan"] + PAN_RANGE * 0.8)
             pan_dir   = -1 if (pan - pan_min_t) > (pan_max_t - pan) else 1
             tilt_step = 0
             last_step = now
+            dbg(f"PATROL_INIT pan={pan:.1f} tilt={tilt:.1f} dir={pan_dir} interval={interval}s pan_range=[{pan_min_t:.1f},{pan_max_t:.1f}]")
             continue
 
-        pan_min = max(PAN_MIN,  home_position["pan"]  - PAN_RANGE * 0.8)
-        pan_max = min(PAN_MAX,  home_position["pan"]  + PAN_RANGE * 0.8)
+        pan_min   = max(PAN_MIN,  home_position["pan"]  - PAN_RANGE * 0.8)
+        pan_max   = min(PAN_MAX,  home_position["pan"]  + PAN_RANGE * 0.8)
         home_tilt = home_position["tilt"]
 
-        # Move one step in current pan direction
         pan += pan_dir * STEP
         pan  = clamp(pan, pan_min, pan_max)
 
-        # If hit end of pan range, reverse direction and advance tilt
         if pan <= pan_min and pan_dir == -1:
             pan_dir = 1
-            if tilt_step == 0:
-                tilt_step = 1   # go up
-            elif tilt_step == 1:
-                tilt_step = 0   # back to home tilt
-            elif tilt_step == -1:
-                tilt_step = 0   # back to home tilt
+            tilt_step = 1 if tilt_step == 0 else 0
+            dbg(f"PATROL_REVERSE dir=RIGHT tilt_step={tilt_step}")
         elif pan >= pan_max and pan_dir == 1:
             pan_dir = -1
-            if tilt_step == 0:
-                tilt_step = -1  # go down
-            elif tilt_step == 1:
-                tilt_step = 0
-            elif tilt_step == -1:
-                tilt_step = 0
+            tilt_step = -1 if tilt_step == 0 else 0
+            dbg(f"PATROL_REVERSE dir=LEFT tilt_step={tilt_step}")
 
         tilt = clamp(home_tilt + tilt_step * STEP, 60.0, 120.0)
+        dbg(f"PATROL_STEP pan={pan:.1f} tilt={tilt:.1f} dir={pan_dir} tilt_step={tilt_step} interval={interval}s elapsed={elapsed:.2f}s")
         _last_user_input_time = time.time()
-        move_servos(pan, tilt)
+        try:
+            move_servos(pan, tilt)
+        except Exception as e:
+            dbg(f"PATROL_MOVE_ERROR {e}")
         last_step = now
 
 threading.Thread(target=patrol_loop, daemon=True).start()
@@ -1532,6 +1545,17 @@ def get_log():
 @app.get("/log/clear")
 def clear_log():
     LOG_FILE.write_text(""); log("LOG_CLEARED"); return {"status":"cleared"}
+
+@app.get("/debug_log")
+def get_debug_log():
+    if DEBUG_FILE.exists():
+        return FileResponse(str(DEBUG_FILE), media_type="text/plain", filename="catblastor_debug.log")
+    return {"error":"no debug log"}
+
+@app.get("/debug_log/clear")
+def clear_debug_log():
+    if DEBUG_FILE.exists(): DEBUG_FILE.write_text("")
+    return {"status":"cleared"}
 
 @app.get("/", response_class=HTMLResponse)
 def index(): return HTML
