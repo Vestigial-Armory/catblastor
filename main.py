@@ -786,8 +786,9 @@ _last_cat_seen       = time.time()
 _last_user_input_time = time.time()
 
 # ─── Audio ────────────────────────────────────────────────────────────────────
-_audio_event_active  = False  # True while current firing event should have audio
-_manual_firing       = False  # True while manual fire sequence is running
+_audio_event_active  = False
+_manual_firing       = False
+_test_firing         = False
 _audio_proc          = None   # current ffplay subprocess
 
 def _audio_should_activate():
@@ -1349,6 +1350,52 @@ async def set_reticle(request: Request):
     RETICLE_FILE.write_text(json.dumps({"x":state["reticle_x"],"y":state["reticle_y"]}))
     return {"reticle_x":state["reticle_x"],"reticle_y":state["reticle_y"]}
 
+@app.get("/fire/test/start")
+def fire_test_start():
+    global _test_firing
+    _test_firing = True
+    threading.Thread(target=_test_fire_loop, daemon=True).start()
+    return {"status":"test_firing"}
+
+@app.get("/fire/test/stop")
+def fire_test_stop():
+    global _test_firing
+    _test_firing = False
+    return {"status":"stopped"}
+
+def _test_fire_loop():
+    """Fires per mode settings as if cat is at reticle. Runs until _test_firing is False or 30s timeout."""
+    global _test_firing
+    deadline = time.time() + 30.0
+    last_fire = 0.0
+    while _test_firing and time.time() < deadline:
+        now = time.time()
+        if state["firing_mode"] == "single":
+            if now - last_fire >= state["reload_time"]:
+                _do_test_burst()
+                last_fire = time.time()
+        elif state["firing_mode"] == "semi_auto":
+            if now - last_fire >= state["semi_auto_delay"]:
+                _do_test_burst()
+                last_fire = time.time()
+        time.sleep(0.05)
+    _test_firing = False
+
+def _do_test_burst():
+    global _manual_firing
+    _manual_firing = True
+    firing["active"] = True
+    log(f"TEST_FIRE burst={state['burst_length']}s")
+    set_pump(True)
+    time.sleep(0.5)
+    set_solenoid(True)
+    time.sleep(state["burst_length"])
+    set_solenoid(False)
+    time.sleep(0.5)
+    set_pump(False)
+    firing["active"] = False
+    _manual_firing = False
+
 @app.get("/fire/manual")
 def fire_manual():
     threading.Thread(target=_manual_fire, daemon=True).start()
@@ -1627,9 +1674,11 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
         <div class="set"><label>Tolerance (px): <span class="vl" id="vl-t">20</span></label>
           <input type="range" min="5" max="100" step="5" value="20" id="on_target_tolerance"
                  oninput="document.getElementById('vl-t').textContent=this.value"></div>
-        <div style="margin-top:10px;display:flex;align-items:center;gap:12px">
+        <div style="margin-top:10px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
           <button class="btn g" onclick="saveSettings()">💾 Save Settings</button>
+          <button class="btn b" id="btn-test-fire" onclick="toggleTestFire(this)" style="background:#1a6fc4">🔫 Test Fire Mode</button>
           <span id="settings-saved-msg" style="color:#4f4;font-size:0.85em;opacity:0;transition:opacity 0.5s">✓ Settings saved</span>
+          <span id="test-fire-msg" style="color:#f84;font-size:0.85em"></span>
         </div>
       </div>
     </details>
@@ -1884,15 +1933,25 @@ sc.addEventListener('mousedown',e=>{
   if(curPage !== 'setup') return;
   const r=sc.getBoundingClientRect();
   const x=Math.round(e.clientX-r.left),y=Math.round(e.clientY-r.top);
+  handleDown(x,y);
+});
 
-  // When targeting active, dragging reticle takes priority
+sc.addEventListener('touchstart',e=>{
+  if(curPage !== 'setup') return;
+  e.preventDefault();
+  const r=sc.getBoundingClientRect();
+  const t=e.touches[0];
+  const x=Math.round(t.clientX-r.left),y=Math.round(t.clientY-r.top);
+  handleDown(x,y);
+},{passive:false});
+
+function handleDown(x,y){
   if(tgtOn){
     const rx=lastStatus.reticle_x||320, ry=lastStatus.reticle_y||240;
-    if(Math.sqrt((x-rx)**2+(y-ry)**2)<30){
+    if(Math.sqrt((x-rx)**2+(y-ry)**2)<40){
       reticleDragging=true; sc.style.cursor='crosshair'; return;
     }
   }
-
   if(vMode==='add'&&!zClosed){
     verts.push([x,y]);
     sendZone();
@@ -1900,11 +1959,11 @@ sc.addEventListener('mousedown',e=>{
     return;
   }
   if(vMode==='delete'){
-    const i=nearV(x,y,15);
+    const i=nearV(x,y,20);
     if(i>=0){verts.splice(i,1);if(verts.length<3)zClosed=false;sendZone();updDrawBtns();}
     return;
   }
-  const vi = nearV(x,y,15);
+  const vi = nearV(x,y,20);
   if(vi>=0){
     dragIdx=vi;
     dragOff={x:x-verts[vi][0],y:y-verts[vi][1]};
@@ -1915,13 +1974,24 @@ sc.addEventListener('mousedown',e=>{
     zoneDragOrigin=verts.map(v=>[v[0],v[1]]);
     sc.style.cursor='grabbing';
   }
-});
+}
 
 sc.addEventListener('mousemove',e=>{
   const r=sc.getBoundingClientRect();
   const x=Math.round(e.clientX-r.left),y=Math.round(e.clientY-r.top);
+  handleMove(x,y);
+});
+
+sc.addEventListener('touchmove',e=>{
+  e.preventDefault();
+  const r=sc.getBoundingClientRect();
+  const t=e.touches[0];
+  const x=Math.round(t.clientX-r.left),y=Math.round(t.clientY-r.top);
+  handleMove(x,y);
+},{passive:false});
+
+function handleMove(x,y){
   if(reticleDragging){
-    // Draw reticle at new position immediately (overlay will update on next status poll)
     lastStatus.reticle_x=x; lastStatus.reticle_y=y;
     return;
   }
@@ -1931,21 +2001,33 @@ sc.addEventListener('mousemove',e=>{
     const dx=x-zoneDragStart.x, dy=y-zoneDragStart.y;
     verts=zoneDragOrigin.map(v=>[v[0]+dx,v[1]+dy]);
   }
-});
+}
 
 sc.addEventListener('mouseup',e=>{
+  const r=sc.getBoundingClientRect();
+  const x=Math.round(e.clientX-r.left),y=Math.round(e.clientY-r.top);
+  handleUp(x,y);
+});
+
+sc.addEventListener('touchend',e=>{
+  e.preventDefault();
+  const r=sc.getBoundingClientRect();
+  const t=e.changedTouches[0];
+  const x=Math.round(t.clientX-r.left),y=Math.round(t.clientY-r.top);
+  handleUp(x,y);
+},{passive:false});
+
+function handleUp(x,y){
   if(reticleDragging){
     reticleDragging=false;
     sc.style.cursor='crosshair';
-    const r=sc.getBoundingClientRect();
-    const x=Math.round(e.clientX-r.left),y=Math.round(e.clientY-r.top);
     fetch('/reticle',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({x,y})});
     return;
   }
   if(dragIdx>=0){sendZone();dragIdx=-1;sc.style.cursor=zClosed?'grab':'crosshair';}
   else if(zoneDrag){sendZone();zoneDrag=false;zoneDragStart=null;zoneDragOrigin=null;sc.style.cursor='grab';}
-});
+}
 
 function nearV(x,y,thresh){
   let best=-1,bestD=thresh;
@@ -2163,6 +2245,28 @@ function toggleTestRec(btn){
       btn.classList.remove('on');
       document.getElementById('rec-test-status').textContent='Done — check Recordings tab';
     }, 10500);
+  }
+}
+
+function toggleTestFire(btn){
+  if(btn.dataset.active==='1'){
+    fetch('/fire/test/stop');
+    btn.dataset.active='0';
+    btn.textContent='🔫 Test Fire Mode';
+    btn.style.background='#1a6fc4';
+    document.getElementById('test-fire-msg').textContent='';
+  } else {
+    fetch('/fire/test/start');
+    btn.dataset.active='1';
+    btn.textContent='⏹ Stop Test Fire';
+    btn.style.background='#c43030';
+    document.getElementById('test-fire-msg').textContent='Firing... (30s max)';
+    setTimeout(()=>{
+      btn.dataset.active='0';
+      btn.textContent='🔫 Test Fire Mode';
+      btn.style.background='#1a6fc4';
+      document.getElementById('test-fire-msg').textContent='';
+    }, 30500);
   }
 }
 
