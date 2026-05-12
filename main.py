@@ -291,10 +291,10 @@ if RETICLE_FILE.exists():
         state["reticle_y"] = saved_r.get("y", FRAME_H//2)
     except Exception:
         pass
-servo_angles = {"pan":90.0,"tilt":90.0}
 home_position = {"pan":90.0,"tilt":90.0}
 if HOME_FILE.exists():
     home_position.update(json.loads(HOME_FILE.read_text()))
+servo_angles = {"pan": home_position["pan"], "tilt": home_position["tilt"]}
 last_activity_time = time.time()
 HOME_TIMEOUT = 60.0
 
@@ -1410,43 +1410,55 @@ def patrol_stop():
     return {"status":"patrol_stopped"}
 
 def patrol_loop():
-    global _patrol_active
-    TILT_OFFSETS = [0.0, 5.0, 0.0, -5.0]  # home, up, home, down
+    """Non-blocking state machine patrol. Steps servo once per interval, never sleeps long."""
+    TILT_OFFSETS = [0.0, 5.0, 0.0, -5.0]  # tilt sequence: home, up, home, down
+    tilt_idx  = 0
+    direction = 1   # 1 = panning right, -1 = panning left
+    pan       = None
+    last_step = 0.0
+
     while True:
         time.sleep(0.1)
         if not _patrol_active or not state["armed"] or state["setup_phase"] is not None:
+            pan = None  # reset position when patrol stops
+            last_step = 0.0
             continue
-        # If cat detected, pause patrol
+
         with detection_lock:
             cats = len(latest_detections) > 0
         if cats:
-            time.sleep(0.5)
+            last_step = time.time()  # delay next step while cat present
             continue
 
-        pan_min  = max(PAN_MIN,  home_position["pan"] - PAN_RANGE * 0.8)
-        pan_max  = min(PAN_MAX,  home_position["pan"] + PAN_RANGE * 0.8)
+        now      = time.time()
         interval = state["patrol_step_interval"]
+        if now - last_step < interval:
+            continue  # not time to step yet
 
-        for tilt_offset in TILT_OFFSETS:
-            if not _patrol_active or not state["armed"]: break
-            tilt = clamp(home_position["tilt"] + tilt_offset, 60.0, 120.0)
-            # Pan left to right
+        pan_min = max(PAN_MIN, home_position["pan"] - PAN_RANGE * 0.8)
+        pan_max = min(PAN_MAX, home_position["pan"] + PAN_RANGE * 0.8)
+        step    = (pan_max - pan_min) / 10.0
+
+        # Initialize pan position on first activation
+        if pan is None:
             pan = pan_min
             direction = 1
-            while _patrol_active and state["armed"]:
-                with detection_lock:
-                    cats = len(latest_detections) > 0
-                if cats:
-                    time.sleep(0.5); continue
-                move_servos(pan, tilt)
-                time.sleep(interval)
-                pan += direction * (pan_max - pan_min) / 10
-                if pan >= pan_max:
-                    pan = pan_max
-                    direction = -1
-                elif pan <= pan_min:
-                    pan = pan_min
-                    break  # completed one full sweep, move to next tilt
+            tilt_idx = 0
+
+        tilt = clamp(home_position["tilt"] + TILT_OFFSETS[tilt_idx], 60.0, 120.0)
+        move_servos(pan, tilt)
+        last_step = now
+
+        # Advance pan
+        pan += direction * step
+        if pan >= pan_max:
+            pan = pan_max
+            direction = -1
+        elif pan <= pan_min:
+            pan = pan_min
+            direction = 1
+            # Completed one full sweep — advance tilt sequence
+            tilt_idx = (tilt_idx + 1) % len(TILT_OFFSETS)
 
 threading.Thread(target=patrol_loop, daemon=True).start()
 
