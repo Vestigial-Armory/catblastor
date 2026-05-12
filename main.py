@@ -915,7 +915,6 @@ threading.Thread(target=targeting_loop,      daemon=True).start()
 threading.Thread(target=recording_loop,      daemon=True).start()
 threading.Thread(target=home_position_loop,  daemon=True).start()
 threading.Thread(target=audio_loop,          daemon=True).start()
-threading.Thread(target=patrol_loop,         daemon=True).start()
 
 import atexit
 
@@ -1448,6 +1447,8 @@ def patrol_loop():
                 elif pan <= pan_min:
                     pan = pan_min
                     break  # completed one full sweep, move to next tilt
+
+threading.Thread(target=patrol_loop, daemon=True).start()
 
 @app.get("/fire/test/start")
 def fire_test_start_ep():
