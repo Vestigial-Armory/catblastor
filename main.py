@@ -268,17 +268,20 @@ state = {
     "on_target_tolerance":20,"setup_phase":None,
     "reticle_x":FRAME_W//2,"reticle_y":FRAME_H//2,
     "target_class":15,
+    "patrol_step_interval":5.0,
 }
 if SETTINGS_FILE.exists():
     saved = json.loads(SETTINGS_FILE.read_text())
     for k in ["firing_mode","burst_length","reload_time","semi_auto_delay",
-               "confidence_threshold","on_target_tolerance","target_class"]:
+               "confidence_threshold","on_target_tolerance","target_class",
+               "patrol_step_interval"]:
         if k in saved: state[k] = saved[k]
 
 def save_settings():
     SETTINGS_FILE.write_text(json.dumps({k:state[k] for k in
         ["firing_mode","burst_length","reload_time","semi_auto_delay",
-         "confidence_threshold","on_target_tolerance","target_class"]}))
+         "confidence_threshold","on_target_tolerance","target_class",
+         "patrol_step_interval"]}))
 
 # Load persisted reticle position
 if RETICLE_FILE.exists():
@@ -789,6 +792,7 @@ _last_user_input_time = time.time()
 _audio_event_active  = False
 _manual_firing       = False
 _test_firing         = False
+_patrol_active       = False
 _audio_proc          = None   # current ffplay subprocess
 
 def _audio_should_activate():
@@ -911,6 +915,7 @@ threading.Thread(target=targeting_loop,      daemon=True).start()
 threading.Thread(target=recording_loop,      daemon=True).start()
 threading.Thread(target=home_position_loop,  daemon=True).start()
 threading.Thread(target=audio_loop,          daemon=True).start()
+threading.Thread(target=patrol_loop,         daemon=True).start()
 
 import atexit
 
@@ -1007,6 +1012,9 @@ def status():
         "reload_time":state["reload_time"],
         "semi_auto_delay":state["semi_auto_delay"],
         "on_target_tolerance":state["on_target_tolerance"],
+        "patrol_step_interval":state["patrol_step_interval"],
+        "patrol_active":_patrol_active,
+        "test_firing":_test_firing,
         "audio":audio_state,
     }
 
@@ -1014,7 +1022,8 @@ def status():
 async def update_settings(request: Request):
     data = await request.json()
     for k in ["firing_mode","burst_length","reload_time","semi_auto_delay",
-               "confidence_threshold","on_target_tolerance","target_class"]:
+               "confidence_threshold","on_target_tolerance","target_class",
+               "patrol_step_interval"]:
         if k in data: state[k] = data[k]
     save_settings(); return {"status":"updated"}
 
@@ -1350,13 +1359,6 @@ async def set_reticle(request: Request):
     RETICLE_FILE.write_text(json.dumps({"x":state["reticle_x"],"y":state["reticle_y"]}))
     return {"reticle_x":state["reticle_x"],"reticle_y":state["reticle_y"]}
 
-@app.get("/fire/test/start")
-def fire_test_start():
-    global _test_firing
-    _test_firing = True
-    threading.Thread(target=_test_fire_loop, daemon=True).start()
-    return {"status":"test_firing"}
-
 @app.get("/fire/test/stop")
 def fire_test_stop():
     global _test_firing
@@ -1395,6 +1397,64 @@ def _do_test_burst():
     set_pump(False)
     firing["active"] = False
     _manual_firing = False
+
+@app.get("/patrol/start")
+def patrol_start():
+    global _patrol_active
+    _patrol_active = True
+    return {"status":"patrol_active"}
+
+@app.get("/patrol/stop")
+def patrol_stop():
+    global _patrol_active
+    _patrol_active = False
+    return {"status":"patrol_stopped"}
+
+def patrol_loop():
+    global _patrol_active
+    TILT_OFFSETS = [0.0, 5.0, 0.0, -5.0]  # home, up, home, down
+    while True:
+        time.sleep(0.1)
+        if not _patrol_active or not state["armed"] or state["setup_phase"] is not None:
+            continue
+        # If cat detected, pause patrol
+        with detection_lock:
+            cats = len(latest_detections) > 0
+        if cats:
+            time.sleep(0.5)
+            continue
+
+        pan_min  = max(PAN_MIN,  home_position["pan"] - PAN_RANGE * 0.8)
+        pan_max  = min(PAN_MAX,  home_position["pan"] + PAN_RANGE * 0.8)
+        interval = state["patrol_step_interval"]
+
+        for tilt_offset in TILT_OFFSETS:
+            if not _patrol_active or not state["armed"]: break
+            tilt = clamp(home_position["tilt"] + tilt_offset, 60.0, 120.0)
+            # Pan left to right
+            pan = pan_min
+            direction = 1
+            while _patrol_active and state["armed"]:
+                with detection_lock:
+                    cats = len(latest_detections) > 0
+                if cats:
+                    time.sleep(0.5); continue
+                move_servos(pan, tilt)
+                time.sleep(interval)
+                pan += direction * (pan_max - pan_min) / 10
+                if pan >= pan_max:
+                    pan = pan_max
+                    direction = -1
+                elif pan <= pan_min:
+                    pan = pan_min
+                    break  # completed one full sweep, move to next tilt
+
+@app.get("/fire/test/start")
+def fire_test_start_ep():
+    global _test_firing
+    _test_firing = True
+    threading.Thread(target=_test_fire_loop, daemon=True).start()
+    return {"status":"test_firing"}
 
 @app.get("/fire/manual")
 def fire_manual():
@@ -1506,6 +1566,7 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
     <button class="btn gr" onclick="fetch('/servos/home/go')">🏠 Home</button>
     <button class="btn gr" onclick="fetch('/servos/home/set')">📌 Set Home</button>
     <button class="btn b" onclick="fetch('/fire/manual')" style="background:#1a6fc4">💧 Fire</button>
+    <button class="btn b" id="btn-patrol-live" onclick="togglePatrol(this)" style="background:#1a5c8a">🔍 Patrol</button>
   </div>
   <div class="ctrl">
     <span style="color:#aaa;font-size:0.85em">Pan/Tilt:</span>
@@ -1540,6 +1601,7 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
         <button class="btn gr" onclick="mv(5,0)">▶</button>
         <button class="btn gr" onclick="fetch('/servos/home/go')">🏠 Go Home</button>
       <button class="btn b" onclick="fetch('/fire/manual')" style="background:#1a6fc4">💧 Fire</button>
+      <button class="btn b" id="btn-patrol-setup" onclick="togglePatrol(this)" style="background:#1a5c8a">🔍 Patrol</button>
       </div>
     </div>
     <div style="min-width:220px;max-width:260px">
@@ -1648,6 +1710,9 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
     <details open>
       <summary style="cursor:pointer;color:#aaf;font-size:0.95em;margin-bottom:8px">⚙ Firing Settings</summary>
       <div class="sg" style="margin-top:8px">
+        <div id="fire-status-bar" style="background:#1a1a2e;border:1px solid #333;border-radius:6px;padding:8px 12px;margin-bottom:8px;font-size:0.85em;font-family:monospace;min-height:28px;color:#aaf">
+          —
+        </div>
         <div class="set"><label>Firing Mode</label>
           <select id="firing_mode">
             <option value="single">Single Fire</option>
@@ -1661,19 +1726,22 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
         </div>
         <div class="set"><label>Confidence: <span class="vl" id="vl-c">0.35</span></label>
           <input type="range" min="0.1" max="1" step="0.05" value="0.35" id="confidence_threshold"
-                 oninput="document.getElementById('vl-c').textContent=parseFloat(this.value).toFixed(2)"></div>
+                 oninput="document.getElementById('vl-c').textContent=parseFloat(this.value).toFixed(2)" onchange="updSettings()"></div>
         <div class="set"><label>Burst (s): <span class="vl" id="vl-b">1.0</span></label>
           <input type="range" min="0.1" max="5" step="0.1" value="1" id="burst_length"
-                 oninput="document.getElementById('vl-b').textContent=parseFloat(this.value).toFixed(1)"></div>
+                 oninput="document.getElementById('vl-b').textContent=parseFloat(this.value).toFixed(1)" onchange="updSettings()"></div>
         <div class="set"><label>Reload (s): <span class="vl" id="vl-r">10</span></label>
           <input type="range" min="1" max="60" step="1" value="10" id="reload_time"
-                 oninput="document.getElementById('vl-r').textContent=this.value"></div>
+                 oninput="document.getElementById('vl-r').textContent=this.value" onchange="updSettings()"></div>
         <div class="set"><label>Semi-Auto Delay (s): <span class="vl" id="vl-s">2</span></label>
           <input type="range" min="0.5" max="10" step="0.5" value="2" id="semi_auto_delay"
-                 oninput="document.getElementById('vl-s').textContent=parseFloat(this.value).toFixed(1)"></div>
+                 oninput="document.getElementById('vl-s').textContent=parseFloat(this.value).toFixed(1)" onchange="updSettings()"></div>
         <div class="set"><label>Tolerance (px): <span class="vl" id="vl-t">20</span></label>
           <input type="range" min="5" max="100" step="5" value="20" id="on_target_tolerance"
-                 oninput="document.getElementById('vl-t').textContent=this.value"></div>
+                 oninput="document.getElementById('vl-t').textContent=this.value" onchange="updSettings()"></div>
+        <div class="set"><label>Patrol Step (s): <span class="vl" id="vl-p">5</span></label>
+          <input type="range" min="1" max="60" step="1" value="5" id="patrol_step_interval"
+                 oninput="document.getElementById('vl-p').textContent=this.value" onchange="updSettings()"></div>
         <div style="margin-top:10px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
           <button class="btn g" onclick="saveSettings()">💾 Save Settings</button>
           <button class="btn b" id="btn-test-fire" onclick="toggleTestFire(this)" style="background:#1a6fc4">🔫 Test Fire Mode</button>
@@ -2074,6 +2142,13 @@ function drawOvs(d){
 
     // Reticle
     const rx = d.reticle_x||320, ry = d.reticle_y||240;
+    const tol = d.on_target_tolerance||20;
+    // Tolerance ring (blue)
+    ctx.strokeStyle='rgba(0,150,255,0.6)'; ctx.lineWidth=1.5;
+    ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.arc(rx,ry,tol,0,2*Math.PI); ctx.stroke();
+    ctx.setLineDash([]);
+    // Reticle crosshair (orange-red)
     ctx.strokeStyle='#ff4400'; ctx.lineWidth=2;
     ctx.beginPath(); ctx.arc(rx,ry,18,0,2*Math.PI); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(rx-28,ry); ctx.lineTo(rx+28,ry); ctx.stroke();
@@ -2248,6 +2323,18 @@ function toggleTestRec(btn){
   }
 }
 
+function togglePatrol(btn){
+  const active = btn.dataset.active==='1';
+  fetch(active ? '/patrol/stop' : '/patrol/start');
+  const btns = document.querySelectorAll('#btn-patrol-live,#btn-patrol-setup');
+  btns.forEach(b=>{
+    b.dataset.active = active ? '0' : '1';
+    b.textContent    = active ? '🔍 Patrol' : '⏹ Stop Patrol';
+    b.style.background = active ? '#1a5c8a' : '#c43030';
+  });
+}
+
+let _testFireTimer = null;
 function toggleTestFire(btn){
   if(btn.dataset.active==='1'){
     fetch('/fire/test/stop');
@@ -2255,19 +2342,57 @@ function toggleTestFire(btn){
     btn.textContent='🔫 Test Fire Mode';
     btn.style.background='#1a6fc4';
     document.getElementById('test-fire-msg').textContent='';
+    if(_testFireTimer){ clearTimeout(_testFireTimer); _testFireTimer=null; }
   } else {
     fetch('/fire/test/start');
     btn.dataset.active='1';
     btn.textContent='⏹ Stop Test Fire';
     btn.style.background='#c43030';
     document.getElementById('test-fire-msg').textContent='Firing... (30s max)';
-    setTimeout(()=>{
+    _testFireTimer=setTimeout(()=>{
       btn.dataset.active='0';
       btn.textContent='🔫 Test Fire Mode';
       btn.style.background='#1a6fc4';
       document.getElementById('test-fire-msg').textContent='';
+      _testFireTimer=null;
     }, 30500);
   }
+}
+
+// Update fire status bar and patrol button state from status poll
+function updateFireStatus(d){
+  const bar = document.getElementById('fire-status-bar');
+  if(!bar) return;
+  const now = Date.now()/1000;
+  let msg = '';
+  if(d.test_firing){
+    msg = `<span style="color:#f84">🔫 TEST FIRE — ${d.firing_mode==='single'?'Single':'Semi-Auto'} · Burst: ${d.burst_length}s</span>`;
+  } else if(d.patrol_active){
+    msg = `<span style="color:#4af">🔍 PATROL — Step: ${d.patrol_step_interval}s</span>`;
+  } else if(d.armed){
+    if(d.firing){
+      msg = `<span style="color:#f44">💧 FIRING — Burst: ${d.burst_length}s</span>`;
+    } else if(d.firing_mode==='single'){
+      const elapsed = now - (d.last_fire_time||0);
+      const remaining = Math.max(0, d.reload_time - elapsed).toFixed(1);
+      msg = elapsed < d.reload_time
+        ? `<span style="color:#fa4">⏳ RELOADING — ${remaining}s remaining</span>`
+        : `<span style="color:#4f4">✓ READY — Single Fire · Burst: ${d.burst_length}s · Reload: ${d.reload_time}s</span>`;
+    } else {
+      msg = `<span style="color:#4f4">✓ READY — Semi-Auto · Burst: ${d.burst_length}s · Delay: ${d.semi_auto_delay}s</span>`;
+    }
+  } else {
+    msg = `<span style="color:#666">DISARMED</span>`;
+  }
+  bar.innerHTML = msg;
+
+  // Sync patrol buttons
+  const patrolBtns = document.querySelectorAll('#btn-patrol-live,#btn-patrol-setup');
+  patrolBtns.forEach(b=>{
+    b.dataset.active = d.patrol_active ? '1' : '0';
+    b.textContent    = d.patrol_active ? '⏹ Stop Patrol' : '🔍 Patrol';
+    b.style.background = d.patrol_active ? '#c43030' : '#1a5c8a';
+  });
 }
 
 function saveSettings(){
@@ -2280,7 +2405,8 @@ function saveSettings(){
       confidence_threshold:parseFloat(document.getElementById('confidence_threshold').value),
       on_target_tolerance:parseInt(document.getElementById('on_target_tolerance').value),
       target_class:parseInt(document.getElementById('target_class').value)||15,
-    })}).then(r=>r.json()).then(d=>{
+      patrol_step_interval:parseFloat(document.getElementById('patrol_step_interval').value),
+    })}).then(r=>r.json()).then(()=>{
       const msg = document.getElementById('settings-saved-msg');
       msg.style.opacity='1';
       setTimeout(()=>{ msg.style.opacity='0'; }, 2500);
@@ -2297,6 +2423,7 @@ function updSettings(){
       confidence_threshold:parseFloat(document.getElementById('confidence_threshold').value),
       on_target_tolerance:parseInt(document.getElementById('on_target_tolerance').value),
       target_class:parseInt(document.getElementById('target_class').value)||15,
+      patrol_step_interval:parseFloat(document.getElementById('patrol_step_interval').value),
     })});
 }
 
@@ -2319,7 +2446,7 @@ function updCam(){
 setInterval(()=>{
   fetch('/status').then(r=>r.json()).then(d=>{
     lastStatus = d;
-    // Status bar
+    updateFireStatus(d);
     document.getElementById('da').className='dot '+(d.armed?'on':'');
     document.getElementById('ta').textContent=d.armed?'Armed':'Disarmed';
     document.getElementById('dc').className='dot '+(d.cats_detected>0?'warn':'');
@@ -2381,6 +2508,7 @@ setInterval(()=>{
       setSlider('reload_time',          d.reload_time,          'vl-r', null);
       setSlider('semi_auto_delay',      d.semi_auto_delay,      'vl-s', v=>parseFloat(v).toFixed(1));
       setSlider('on_target_tolerance',  d.on_target_tolerance,  'vl-t', null);
+      setSlider('patrol_step_interval', d.patrol_step_interval, 'vl-p', null);
       const fm = document.getElementById('firing_mode');
       if(fm && d.firing_mode) fm.value = d.firing_mode;
       ['brightness','contrast','saturation','sharpness','ev','awb_gain_r','awb_gain_b'].forEach(k=>{
