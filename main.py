@@ -1001,6 +1001,11 @@ def status():
         "reticle_x":state["reticle_x"],"reticle_y":state["reticle_y"],
         "target_class":state["target_class"],
         "confidence_threshold":state["confidence_threshold"],
+        "firing_mode":state["firing_mode"],
+        "burst_length":state["burst_length"],
+        "reload_time":state["reload_time"],
+        "semi_auto_delay":state["semi_auto_delay"],
+        "on_target_tolerance":state["on_target_tolerance"],
         "audio":audio_state,
     }
 
@@ -1223,6 +1228,28 @@ def targeting_stop():
     set_gpio(False, False)
     return {"targeting":False}
 
+@app.post("/recordings/batch/delete")
+async def batch_delete(request: Request):
+    data = await request.json()
+    for fn in data.get("files", []):
+        p = RECORDINGS_DIR / fn
+        if p.exists(): p.unlink()
+    return {"status":"deleted"}
+
+@app.post("/recordings/batch/download")
+async def batch_download(request: Request):
+    import zipfile, io
+    data  = await request.json()
+    files = [RECORDINGS_DIR / fn for fn in data.get("files", []) if (RECORDINGS_DIR / fn).exists()]
+    buf   = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in files:
+            zf.write(f, f.name)
+    buf.seek(0)
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(buf, media_type="application/zip",
+        headers={"Content-Disposition":"attachment; filename=catblastor_recordings.zip"})
+
 @app.get("/recordings")
 def list_recordings():
     files = sorted(RECORDINGS_DIR.glob("*.mp4"), reverse=True)
@@ -1335,7 +1362,7 @@ def _manual_fire():
     set_pump(True)
     time.sleep(0.5)
     set_solenoid(True)
-    time.sleep(1.0)
+    time.sleep(state["burst_length"])
     set_solenoid(False)
     time.sleep(0.5)
     set_pump(False)
@@ -1575,31 +1602,31 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
       <summary style="cursor:pointer;color:#aaf;font-size:0.95em;margin-bottom:8px">⚙ Firing Settings</summary>
       <div class="sg" style="margin-top:8px">
         <div class="set"><label>Firing Mode</label>
-          <select id="firing_mode" onchange="updSettings()">
+          <select id="firing_mode">
             <option value="single">Single Fire</option>
             <option value="semi_auto">Semi-Auto</option>
           </select></div>
         <div class="set"><label>Target Class</label>
           <input type="text" id="class-search" placeholder="Search class..." style="width:140px;margin-right:6px"
                  oninput="filterClasses(this.value)">
-          <select id="target_class" size="1" onchange="updSettings()" style="width:160px"></select>
+          <select id="target_class" size="1" style="width:160px"></select>
           <span id="class-name" style="color:#aaa;font-size:0.85em;margin-left:6px"></span>
         </div>
         <div class="set"><label>Confidence: <span class="vl" id="vl-c">0.35</span></label>
           <input type="range" min="0.1" max="1" step="0.05" value="0.35" id="confidence_threshold"
-                 oninput="document.getElementById('vl-c').textContent=this.value" onchange="updSettings()"></div>
+                 oninput="document.getElementById('vl-c').textContent=parseFloat(this.value).toFixed(2)"></div>
         <div class="set"><label>Burst (s): <span class="vl" id="vl-b">1.0</span></label>
           <input type="range" min="0.1" max="5" step="0.1" value="1" id="burst_length"
-                 oninput="document.getElementById('vl-b').textContent=this.value" onchange="updSettings()"></div>
+                 oninput="document.getElementById('vl-b').textContent=parseFloat(this.value).toFixed(1)"></div>
         <div class="set"><label>Reload (s): <span class="vl" id="vl-r">10</span></label>
           <input type="range" min="1" max="60" step="1" value="10" id="reload_time"
-                 oninput="document.getElementById('vl-r').textContent=this.value" onchange="updSettings()"></div>
+                 oninput="document.getElementById('vl-r').textContent=this.value"></div>
         <div class="set"><label>Semi-Auto Delay (s): <span class="vl" id="vl-s">2</span></label>
           <input type="range" min="0.5" max="10" step="0.5" value="2" id="semi_auto_delay"
-                 oninput="document.getElementById('vl-s').textContent=this.value" onchange="updSettings()"></div>
+                 oninput="document.getElementById('vl-s').textContent=parseFloat(this.value).toFixed(1)"></div>
         <div class="set"><label>Tolerance (px): <span class="vl" id="vl-t">20</span></label>
           <input type="range" min="5" max="100" step="5" value="20" id="on_target_tolerance"
-                 oninput="document.getElementById('vl-t').textContent=this.value" onchange="updSettings()"></div>
+                 oninput="document.getElementById('vl-t').textContent=this.value"></div>
         <div style="margin-top:10px;display:flex;align-items:center;gap:12px">
           <button class="btn g" onclick="saveSettings()">💾 Save Settings</button>
           <span id="settings-saved-msg" style="color:#4f4;font-size:0.85em;opacity:0;transition:opacity 0.5s">✓ Settings saved</span>
@@ -2239,9 +2266,19 @@ setInterval(()=>{
     if(d.cam&&!camInit){
       camInit=true;
       initClassSelector(d.target_class||15);
-      const confEl=document.getElementById('confidence_threshold');
-      const confVl=document.getElementById('vl-c');
-      if(confEl&&d.confidence_threshold){confEl.value=d.confidence_threshold;if(confVl)confVl.textContent=d.confidence_threshold;}
+      // Initialize all settings sliders from server values
+      const setSlider = (id, val, vlId, fmt) => {
+        const el = document.getElementById(id);
+        const vl = document.getElementById(vlId);
+        if(el && val !== undefined){ el.value = val; if(vl) vl.textContent = fmt ? fmt(val) : val; }
+      };
+      setSlider('confidence_threshold', d.confidence_threshold, 'vl-c', v=>parseFloat(v).toFixed(2));
+      setSlider('burst_length',         d.burst_length,         'vl-b', v=>parseFloat(v).toFixed(1));
+      setSlider('reload_time',          d.reload_time,          'vl-r', null);
+      setSlider('semi_auto_delay',      d.semi_auto_delay,      'vl-s', v=>parseFloat(v).toFixed(1));
+      setSlider('on_target_tolerance',  d.on_target_tolerance,  'vl-t', null);
+      const fm = document.getElementById('firing_mode');
+      if(fm && d.firing_mode) fm.value = d.firing_mode;
       ['brightness','contrast','saturation','sharpness','ev','awb_gain_r','awb_gain_b'].forEach(k=>{
         const s=document.getElementById('cam-'+k);
         const n=document.getElementById('num-'+k);
@@ -2268,10 +2305,21 @@ function loadRecs(){
   fetch('/recordings').then(r=>r.json()).then(d=>{
     const list=document.getElementById('rl');
     if(!d.recordings.length){list.innerHTML='<p style="color:#666">No recordings yet</p>';return;}
-    list.innerHTML=d.recordings.map(f=>`
+    list.innerHTML=`
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:4px;cursor:pointer">
+          <input type="checkbox" id="rec-select-all" onchange="toggleSelectAll(this)"> Select All
+        </label>
+        <button class="btn r" style="padding:4px 10px;font-size:0.8em" onclick="batchDelete()">✕ Delete Selected</button>
+        <button class="btn b" style="padding:4px 10px;font-size:0.8em" onclick="batchDownload()">⬇ Download Selected</button>
+      </div>
+      ${d.recordings.map(f=>`
       <div class="ri" style="flex-direction:column;align-items:flex-start;gap:6px">
         <div style="display:flex;justify-content:space-between;width:100%;align-items:center">
-          <span id="rn-${CSS.escape(f.name)}" style="font-size:0.9em">${f.name}</span>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+            <input type="checkbox" class="rec-cb" value="${f.name}">
+            <span id="rn-${CSS.escape(f.name)}" style="font-size:0.9em">${f.name}</span>
+          </label>
           <span style="color:#888;font-size:0.8em">${f.size_mb}MB · ${f.duration_s}s</span>
         </div>
         <div style="display:flex;gap:6px;flex-wrap:wrap">
@@ -2281,11 +2329,39 @@ function loadRecs(){
           <button class="btn r" style="padding:4px 10px;font-size:0.8em" onclick="deleteRec('${f.name}')">✕ Delete</button>
         </div>
         <div id="player-${CSS.escape(f.name)}" style="display:none;width:100%">
-          <video controls style="width:100%;max-width:640px;background:#000;margin-top:4px">
+          <video controls preload="metadata" style="width:100%;max-width:640px;background:#000;margin-top:4px">
             <source src="/rec_files/${f.name}" type="video/mp4">
           </video>
         </div>
-      </div>`).join('');
+      </div>`).join('')}`;
+  });
+}
+
+function toggleSelectAll(cb){
+  document.querySelectorAll('.rec-cb').forEach(c=>c.checked=cb.checked);
+}
+
+function getSelected(){
+  return [...document.querySelectorAll('.rec-cb:checked')].map(c=>c.value);
+}
+
+function batchDelete(){
+  const files = getSelected();
+  if(!files.length){alert('No recordings selected');return;}
+  if(!confirm(`Delete ${files.length} recording(s)?`)) return;
+  fetch('/recordings/batch/delete',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({files})}).then(()=>loadRecs());
+}
+
+function batchDownload(){
+  const files = getSelected();
+  if(!files.length){alert('No recordings selected');return;}
+  fetch('/recordings/batch/download',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({files})}).then(r=>r.blob()).then(blob=>{
+      const a=document.createElement('a');
+      a.href=URL.createObjectURL(blob);
+      a.download='catblastor_recordings.zip';
+      a.click();
   });
 }
 
