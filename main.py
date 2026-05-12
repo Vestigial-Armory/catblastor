@@ -1417,56 +1417,75 @@ def patrol_stop():
     return {"status":"patrol_stopped"}
 
 def patrol_loop():
-    """Non-blocking state machine patrol. Steps servo once per interval, never sleeps long."""
-    TILT_OFFSETS = [0.0, 5.0, 0.0, -5.0]  # tilt sequence: home, up, home, down
-    tilt_idx  = 0
-    direction = 1   # 1 = panning right, -1 = panning left
-    pan       = None
+    pan       = None   # current patrol pan position
+    tilt      = None   # current patrol tilt position
+    pan_dir   = -1     # -1 = moving left, +1 = moving right
+    tilt_step = 0      # 0=home, 1=up, -1=down
     last_step = 0.0
+    STEP      = 5.0    # degrees per step
 
     while True:
         time.sleep(0.1)
+
         if not _patrol_active or not state["armed"] or state["setup_phase"] is not None:
-            pan = None  # reset position when patrol stops
+            pan  = None
+            tilt = None
             last_step = 0.0
             continue
 
+        # Pause patrol while cat detected
         with detection_lock:
             cats = len(latest_detections) > 0
         if cats:
-            last_step = time.time()  # delay next step while cat present
+            last_step = time.time()
             continue
 
         now      = time.time()
         interval = state["patrol_step_interval"]
         if now - last_step < interval:
-            continue  # not time to step yet
+            continue
 
-        pan_min = max(PAN_MIN, home_position["pan"] - PAN_RANGE * 0.8)
-        pan_max = min(PAN_MAX, home_position["pan"] + PAN_RANGE * 0.8)
-        step    = (pan_max - pan_min) / 10.0
-
-        # Initialize pan position on first activation
+        # Initialize at current position on first activation
         if pan is None:
-            pan = pan_min
-            direction = 1
-            tilt_idx = 0
+            pan      = servo_angles["pan"]
+            tilt     = servo_angles["tilt"]
+            pan_dir  = -1
+            tilt_step = 0
+            last_step = now
+            continue
 
-        tilt = clamp(home_position["tilt"] + TILT_OFFSETS[tilt_idx], 60.0, 120.0)
+        pan_min = max(PAN_MIN,  home_position["pan"]  - PAN_RANGE * 0.8)
+        pan_max = min(PAN_MAX,  home_position["pan"]  + PAN_RANGE * 0.8)
+        home_tilt = home_position["tilt"]
+
+        # Move one step in current pan direction
+        pan += pan_dir * STEP
+        pan  = clamp(pan, pan_min, pan_max)
+
+        # If hit end of pan range, reverse direction and advance tilt
+        if pan <= pan_min and pan_dir == -1:
+            pan_dir = 1
+            if tilt_step == 0:
+                tilt_step = 1   # go up
+            elif tilt_step == 1:
+                tilt_step = 0   # back to home tilt
+            elif tilt_step == -1:
+                tilt_step = 0   # back to home tilt
+        elif pan >= pan_max and pan_dir == 1:
+            pan_dir = -1
+            if tilt_step == 0:
+                tilt_step = -1  # go down
+            elif tilt_step == 1:
+                tilt_step = 0
+            elif tilt_step == -1:
+                tilt_step = 0
+
+        tilt = clamp(home_tilt + tilt_step * STEP, 60.0, 120.0)
+
+        global _last_user_input_time
+        _last_user_input_time = time.time()
         move_servos(pan, tilt)
-        _last_user_input_time = time.time()  # prevent home_loop and tracking from overriding
         last_step = now
-
-        # Advance pan
-        pan += direction * step
-        if pan >= pan_max:
-            pan = pan_max
-            direction = -1
-        elif pan <= pan_min:
-            pan = pan_min
-            direction = 1
-            # Completed one full sweep — advance tilt sequence
-            tilt_idx = (tilt_idx + 1) % len(TILT_OFFSETS)
 
 threading.Thread(target=patrol_loop, daemon=True).start()
 
