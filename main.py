@@ -974,8 +974,12 @@ def arm():
 
 @app.get("/disarm")
 def disarm():
-    global targeting_active
-    state["armed"] = False; targeting_active = False
+    global targeting_active, _patrol_active
+    state["armed"] = False
+    targeting_active = False
+    if _patrol_active:
+        _patrol_active = False
+        threading.Thread(target=lambda: move_servos(home_position["pan"], home_position["tilt"], slow=True), daemon=True).start()
     set_gpio(False, False)
     log("DISARM")
     return {"status":"disarmed"}
@@ -2477,6 +2481,19 @@ function fastPoll(d){
   // Status indicators
   document.getElementById('da').className='dot '+(d.armed?'on':'');
   document.getElementById('ta').textContent=d.armed?'Armed':'Disarmed';
+
+  // Patrol buttons: gray out when disarmed, reset if patrol was on and now disarmed
+  const patrolBtns = document.querySelectorAll('#btn-patrol-live,#btn-patrol-setup');
+  patrolBtns.forEach(b=>{
+    b.disabled = !d.armed;
+    b.style.opacity = d.armed ? '1' : '0.4';
+    b.style.cursor  = d.armed ? 'pointer' : 'not-allowed';
+    if(!d.armed && b.dataset.active==='1'){
+      b.dataset.active='0';
+      b.textContent='🔍 Patrol';
+      b.style.background='#1a5c8a';
+    }
+  });
   document.getElementById('dc').className='dot '+(d.cats_detected>0?'warn':'');
   document.getElementById('tc').textContent=d.cats_detected>0?d.cats_detected+' cat(s)':'No cats';
   document.getElementById('dz').className='dot '+(d.cats_in_zone>0?'warn':'');
