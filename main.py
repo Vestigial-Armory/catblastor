@@ -888,6 +888,8 @@ def home_position_loop():
         time.sleep(0.5)
         if not state["armed"] or state["setup_phase"] is not None:
             continue
+        if _patrol_active:  # patrol manages camera position
+            continue
         with detection_lock:
             cats = len(latest_detections)
         if cats > 0:
@@ -1452,6 +1454,7 @@ def patrol_loop():
 
         tilt = clamp(home_position["tilt"] + TILT_OFFSETS[tilt_idx], 60.0, 120.0)
         move_servos(pan, tilt)
+        _last_user_input_time = time.time()  # prevent home_loop and tracking from overriding
         last_step = now
 
         # Advance pan
