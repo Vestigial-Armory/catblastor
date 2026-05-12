@@ -1419,12 +1419,13 @@ def patrol_stop():
     return {"status":"patrol_stopped"}
 
 def patrol_loop():
-    pan       = None   # current patrol pan position
-    tilt      = None   # current patrol tilt position
-    pan_dir   = -1     # -1 = moving left, +1 = moving right
-    tilt_step = 0      # 0=home, 1=up, -1=down
+    global _last_user_input_time
+    pan       = None
+    tilt      = None
+    pan_dir   = -1
+    tilt_step = 0
     last_step = 0.0
-    STEP      = 5.0    # degrees per step
+    STEP      = 5.0
 
     while True:
         time.sleep(0.1)
@@ -1486,8 +1487,6 @@ def patrol_loop():
                 tilt_step = 0
 
         tilt = clamp(home_tilt + tilt_step * STEP, 60.0, 120.0)
-
-        global _last_user_input_time
         _last_user_input_time = time.time()
         move_servos(pan, tilt)
         last_step = now
@@ -1600,6 +1599,7 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
     <div class="si"><div class="dot" id="df"></div><span id="tf">Idle</span></div>
     <div class="si"><div class="dot" id="dr"></div><span id="tr">Not recording</span></div>
   </div>
+  <div class="fire-status-bar" style="background:#1a1a2e;border:1px solid #333;border-radius:6px;padding:6px 12px;margin:4px 0;font-size:0.85em;font-family:monospace;min-height:24px;color:#aaf">—</div>
   <div class="vw">
     <img src="/stream" width="640" height="480" style="display:block;background:#000">
     <canvas id="ov-live" width="640" height="480" style="cursor:default"></canvas>
@@ -1755,7 +1755,7 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
     <details open>
       <summary style="cursor:pointer;color:#aaf;font-size:0.95em;margin-bottom:8px">⚙ Firing Settings</summary>
       <div class="sg" style="margin-top:8px">
-        <div id="fire-status-bar" style="background:#1a1a2e;border:1px solid #333;border-radius:6px;padding:8px 12px;margin-bottom:8px;font-size:0.85em;font-family:monospace;min-height:28px;color:#aaf">
+        <div class="fire-status-bar" style="background:#1a1a2e;border:1px solid #333;border-radius:6px;padding:8px 12px;margin-bottom:8px;font-size:0.85em;font-family:monospace;min-height:28px;color:#aaf">
           —
         </div>
         <div class="set"><label>Firing Mode</label>
@@ -2406,8 +2406,8 @@ function toggleTestFire(btn){
 
 // Update fire status bar and patrol button state from status poll
 function updateFireStatus(d){
-  const bar = document.getElementById('fire-status-bar');
-  if(!bar) return;
+  const bars = document.querySelectorAll('.fire-status-bar');
+  if(!bars.length) return;
   const now = Date.now()/1000;
   let msg = '';
   if(d.test_firing){
@@ -2429,7 +2429,7 @@ function updateFireStatus(d){
   } else {
     msg = `<span style="color:#666">DISARMED</span>`;
   }
-  bar.innerHTML = msg;
+  bars.forEach(bar => bar.innerHTML = msg);
 }
 
 function saveSettings(){
