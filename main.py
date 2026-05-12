@@ -451,7 +451,7 @@ def capture_loop():
                         latest_frame = f.copy()
             except Exception:
                 pass
-        time.sleep(1/10)
+        time.sleep(1/3)
 
 def _inference_worker(frame_queue, result_queue, model_path, infer_w, infer_h, frame_w, frame_h):
     """Runs in a separate process — has its own GIL, doesn't block main process."""
@@ -680,7 +680,9 @@ def firing_loop():
 
         # ── Solenoid ──────────────────────────────────────────────────────────
         rx = state["reticle_x"]; ry = state["reticle_y"]
-        on_target = t is not None and bool(reticle_to_bbox_dist(rx, ry, t) <= state["on_target_tolerance"])
+        on_target = t is not None and bool(
+            np.sqrt((t["cx"]-rx)**2 + (t["cy"]-ry)**2) <= state["on_target_tolerance"]
+        )
 
         solenoid_allowed = (
             any_detected and
@@ -2428,14 +2430,6 @@ function updateFireStatus(d){
     msg = `<span style="color:#666">DISARMED</span>`;
   }
   bar.innerHTML = msg;
-
-  // Sync patrol buttons
-  const patrolBtns = document.querySelectorAll('#btn-patrol-live,#btn-patrol-setup');
-  patrolBtns.forEach(b=>{
-    b.dataset.active = d.patrol_active ? '1' : '0';
-    b.textContent    = d.patrol_active ? '⏹ Stop Patrol' : '🔍 Patrol';
-    b.style.background = d.patrol_active ? '#c43030' : '#1a5c8a';
-  });
 }
 
 function saveSettings(){
@@ -2456,20 +2450,6 @@ function saveSettings(){
     });
 }
 
-function updSettings(){
-  fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({
-      firing_mode:document.getElementById('firing_mode').value,
-      burst_length:parseFloat(document.getElementById('burst_length').value),
-      reload_time:parseFloat(document.getElementById('reload_time').value),
-      semi_auto_delay:parseFloat(document.getElementById('semi_auto_delay').value),
-      confidence_threshold:parseFloat(document.getElementById('confidence_threshold').value),
-      on_target_tolerance:parseInt(document.getElementById('on_target_tolerance').value),
-      target_class:parseInt(document.getElementById('target_class').value)||15,
-      patrol_step_interval:parseFloat(document.getElementById('patrol_step_interval').value),
-    })});
-}
-
 function syncN(k,v){const el=document.getElementById('num-'+k);if(el)el.value=parseFloat(v).toFixed(2);}
 function syncS(k,v){const el=document.getElementById('cam-'+k);if(el)el.value=v;}
 function updCam(){
@@ -2486,94 +2466,128 @@ function updCam(){
 }
 
 // ── Status Polling ─────────────────────────────────────────────────────────
+// Fast poll (100ms): detections, firing, armed, servo bars, canvas overlay
+// Slow poll (500ms): settings init, calibration, phase sync, status bar
+
+let _lastDrawKey = '';
+
+function fastPoll(d){
+  lastStatus = d;
+
+  // Status indicators
+  document.getElementById('da').className='dot '+(d.armed?'on':'');
+  document.getElementById('ta').textContent=d.armed?'Armed':'Disarmed';
+  document.getElementById('dc').className='dot '+(d.cats_detected>0?'warn':'');
+  document.getElementById('tc').textContent=d.cats_detected>0?d.cats_detected+' cat(s)':'No cats';
+  document.getElementById('dz').className='dot '+(d.cats_in_zone>0?'warn':'');
+  document.getElementById('tz').textContent=d.cats_in_zone>0?d.cats_in_zone+' in zone':'Zone clear';
+  document.getElementById('df').className='dot '+(d.firing?'warn':'');
+  document.getElementById('tf').textContent=d.firing?'💦 FIRING':'Idle';
+  document.getElementById('dr').className='dot '+(d.recording?'rec':'');
+  document.getElementById('tr').textContent=d.recording?'⏺ Recording':'Not recording';
+
+  // Servo bars
+  updServoBars(d.pan_pct||0, d.tilt_pct||0);
+
+  // Dirty-check canvas — only redraw if something visual changed
+  const drawKey = JSON.stringify([
+    d.detections, d.pan, d.tilt, d.reticle_x, d.reticle_y,
+    d.on_target_tolerance, d.recording, d.armed
+  ]);
+  if(drawKey !== _lastDrawKey){
+    _lastDrawKey = drawKey;
+    drawOvs(d);
+  }
+}
+
+function slowPoll(d){
+  updateFireStatus(d);
+
+  // Setup tab updates
+  const inSetupCalPhase = ['forced_L','forced_R','forced_up','forced_down','extra'].includes(curPhase);
+  if(inSetupCalPhase && d.setup_zone && d.setup_zone.length > 0){
+    const panChanged  = lastServerPan  !== null && Math.abs(d.pan  - lastServerPan)  > 0.3;
+    const tiltChanged = lastServerTilt !== null && Math.abs(d.tilt - lastServerTilt) > 0.3;
+    if(panChanged || tiltChanged || verts.length === 0){
+      verts = d.setup_zone.map(p=>[p[0],p[1]]);
+      zClosed = d.setup_zone_closed;
+    }
+  }
+  lastServerPan  = d.pan;
+  lastServerTilt = d.tilt;
+
+  if(d.setup_phase !== curPhase && curPage === 'setup') applyPhase(d.setup_phase);
+  if(curPage === 'setup' && d.strength) updStrength({strength:d.strength, n_points:d.n_cal_points});
+
+  if(curPhase === 'extra'){
+    const el = document.getElementById('interp-debug');
+    if(el){
+      const n=d.n_cal_points||0, tot=d.n_total_positions||361;
+      const pct=Math.round(n/tot*100);
+      const exact=d.setup_zone_exact
+        ?'<span style="color:#0f8">● Exact saved point</span>'
+        :'<span style="color:#fa0">○ Interpolated</span>';
+      el.innerHTML=`${exact} | Grid: Pan ${d.grid_pan}° (${d.grid_pan_pct}%) Tilt ${d.grid_tilt}° (${d.grid_tilt_pct}%)<br>`+
+        `Saved ${n}/${tot} positions (${pct}%) — pan/tilt to explore, zone auto-saves`;
+    }
+  }
+
+  if(d.cam && !camInit){
+    camInit = true;
+    initClassSelector(d.target_class||15);
+    const setSlider = (id, val, vlId, fmt) => {
+      const el=document.getElementById(id), vl=document.getElementById(vlId);
+      if(el && val !== undefined){ el.value=val; if(vl) vl.textContent=fmt?fmt(val):val; }
+    };
+    setSlider('confidence_threshold', d.confidence_threshold, 'vl-c', v=>parseFloat(v).toFixed(2));
+    setSlider('burst_length',         d.burst_length,         'vl-b', v=>parseFloat(v).toFixed(1));
+    setSlider('reload_time',          d.reload_time,          'vl-r', null);
+    setSlider('semi_auto_delay',      d.semi_auto_delay,      'vl-s', v=>parseFloat(v).toFixed(1));
+    setSlider('on_target_tolerance',  d.on_target_tolerance,  'vl-t', null);
+    setSlider('patrol_step_interval', d.patrol_step_interval, 'vl-p', null);
+    const fm=document.getElementById('firing_mode');
+    if(fm && d.firing_mode) fm.value=d.firing_mode;
+    ['brightness','contrast','saturation','sharpness','ev','awb_gain_r','awb_gain_b'].forEach(k=>{
+      const s=document.getElementById('cam-'+k), n=document.getElementById('num-'+k);
+      if(s) s.value=d.cam[k];
+      if(n) n.value=parseFloat(d.cam[k]).toFixed(2);
+    });
+  }
+
+  if(['forced_L','forced_R','forced_up','forced_down','extra'].includes(curPhase)){
+    if(d.zone_px && d.zone_px.length > 0 && verts.length === 0){
+      verts=d.zone_px.map(p=>[p[0],p[1]]); zClosed=d.zone_closed;
+    }
+  }
+}
+
+let _slowTick = 0;
 setInterval(()=>{
   fetch('/status').then(r=>r.json()).then(d=>{
-    lastStatus = d;
-    updateFireStatus(d);
-    document.getElementById('da').className='dot '+(d.armed?'on':'');
-    document.getElementById('ta').textContent=d.armed?'Armed':'Disarmed';
-    document.getElementById('dc').className='dot '+(d.cats_detected>0?'warn':'');
-    document.getElementById('tc').textContent=d.cats_detected>0?d.cats_detected+' cat(s)':'No cats';
-    document.getElementById('dz').className='dot '+(d.cats_in_zone>0?'warn':'');
-    document.getElementById('tz').textContent=d.cats_in_zone>0?d.cats_in_zone+' in zone':'Zone clear';
-    document.getElementById('df').className='dot '+(d.firing?'warn':'');
-    document.getElementById('tf').textContent=d.firing?'💦 FIRING':'Idle';
-    document.getElementById('dr').className='dot '+(d.recording?'rec':'');
-    document.getElementById('tr').textContent=d.recording?'⏺ Recording':'Not recording';
-
-    // Servo bars
-    updServoBars(d.pan_pct||0,d.tilt_pct||0);
-
-    // Sync verts from server when servo position changes (camera moved)
-    const inSetupCalPhase = ['forced_L','forced_R','forced_up','forced_down','extra'].includes(curPhase);
-    if(inSetupCalPhase && d.setup_zone && d.setup_zone.length > 0){
-      const panChanged = lastServerPan !== null && Math.abs(d.pan - lastServerPan) > 0.3;
-      const tiltChanged = lastServerTilt !== null && Math.abs(d.tilt - lastServerTilt) > 0.3;
-      if(panChanged || tiltChanged || verts.length === 0){
-        verts = d.setup_zone.map(p=>[p[0],p[1]]);
-        zClosed = d.setup_zone_closed;
-      }
-    }
-    lastServerPan = d.pan;
-    lastServerTilt = d.tilt;
-
-    // Phase sync
-    if(d.setup_phase!==curPhase&&curPage==='setup') applyPhase(d.setup_phase);
-
-    // Strength update whenever on setup page
-    if(curPage==='setup'&&d.strength) updStrength({strength:d.strength,n_points:d.n_cal_points});
-
-    // Interpolation debug in extra phase
-    if(curPhase==='extra'){
-      const el=document.getElementById('interp-debug');
-      if(el){
-        const n=d.n_cal_points||0;
-        const tot=d.n_total_positions||361;
-        const pct=Math.round(n/tot*100);
-        const exact=d.setup_zone_exact?'<span style="color:#0f8">● Exact saved point</span>':'<span style="color:#fa0">○ Interpolated</span>';
-        el.innerHTML=`${exact} | Grid: Pan ${d.grid_pan}° (${d.grid_pan_pct}%) Tilt ${d.grid_tilt}° (${d.grid_tilt_pct}%)<br>`+
-          `Saved ${n}/${tot} positions (${pct}%) — pan/tilt to explore, zone auto-saves`;
-      }
-    }
-
-    // Camera settings init
-    if(d.cam&&!camInit){
-      camInit=true;
-      initClassSelector(d.target_class||15);
-      // Initialize all settings sliders from server values
-      const setSlider = (id, val, vlId, fmt) => {
-        const el = document.getElementById(id);
-        const vl = document.getElementById(vlId);
-        if(el && val !== undefined){ el.value = val; if(vl) vl.textContent = fmt ? fmt(val) : val; }
-      };
-      setSlider('confidence_threshold', d.confidence_threshold, 'vl-c', v=>parseFloat(v).toFixed(2));
-      setSlider('burst_length',         d.burst_length,         'vl-b', v=>parseFloat(v).toFixed(1));
-      setSlider('reload_time',          d.reload_time,          'vl-r', null);
-      setSlider('semi_auto_delay',      d.semi_auto_delay,      'vl-s', v=>parseFloat(v).toFixed(1));
-      setSlider('on_target_tolerance',  d.on_target_tolerance,  'vl-t', null);
-      setSlider('patrol_step_interval', d.patrol_step_interval, 'vl-p', null);
-      const fm = document.getElementById('firing_mode');
-      if(fm && d.firing_mode) fm.value = d.firing_mode;
-      ['brightness','contrast','saturation','sharpness','ev','awb_gain_r','awb_gain_b'].forEach(k=>{
-        const s=document.getElementById('cam-'+k);
-        const n=document.getElementById('num-'+k);
-        if(s)s.value=d.cam[k];
-        if(n)n.value=parseFloat(d.cam[k]).toFixed(2);
-      });
-    }
-
-    // Sync verts from server in forced/extra phases
-    if(['forced_L','forced_R','forced_up','forced_down','extra'].includes(curPhase)){
-      if(d.zone_px&&d.zone_px.length>0&&verts.length===0){
-        verts=d.zone_px.map(p=>[p[0],p[1]]);
-        zClosed=d.zone_closed;
-      }
-    }
-
-    // Draw overlays
-    drawOvs(d);
+    fastPoll(d);
+    if(++_slowTick >= 5){ _slowTick=0; slowPoll(d); }
   });
-},200);
+}, 100);
+
+// Debounced updSettings — waits 300ms after last change before POSTing
+let _settingsTimer = null;
+function updSettings(){
+  if(_settingsTimer) clearTimeout(_settingsTimer);
+  _settingsTimer = setTimeout(()=>{
+    _settingsTimer = null;
+    fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        firing_mode:document.getElementById('firing_mode').value,
+        burst_length:parseFloat(document.getElementById('burst_length').value),
+        reload_time:parseFloat(document.getElementById('reload_time').value),
+        semi_auto_delay:parseFloat(document.getElementById('semi_auto_delay').value),
+        confidence_threshold:parseFloat(document.getElementById('confidence_threshold').value),
+        on_target_tolerance:parseInt(document.getElementById('on_target_tolerance').value),
+        target_class:parseInt(document.getElementById('target_class').value)||15,
+        patrol_step_interval:parseFloat(document.getElementById('patrol_step_interval').value),
+      })});
+  }, 300);
+}
 
 // ── Recordings ─────────────────────────────────────────────────────────────
 function loadRecs(){
