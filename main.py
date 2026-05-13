@@ -603,7 +603,7 @@ def servo_tracking_loop():
                 _last_inf_time = time.time()
 
         # Stop if no fresh inference in 500ms
-        if time.time() - _last_inf_time > 0.7:
+        if time.time() - _last_inf_time > 0.4:
             time.sleep(0.05); continue
 
         t = select_target(dets)
@@ -618,7 +618,7 @@ def servo_tracking_loop():
         if abs(err_x) < 10 and abs(err_y) < 10:
             time.sleep(0.05); continue
 
-        MAX_STEP  = 3.0
+        MAX_STEP  = 1.5
         step_pan  = -np.sign(err_x) * min(MAX_STEP, abs(err_x) / 40.0 * MAX_STEP)
         step_tilt =  np.sign(err_y) * min(MAX_STEP, abs(err_y) / 40.0 * MAX_STEP)
 
