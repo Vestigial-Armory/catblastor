@@ -584,9 +584,8 @@ def select_target(detections):
     return t
 
 def servo_tracking_loop():
-    _last_log      = 0.0
-    _last_inf_time = 0.0
-    _prev_seq      = -1
+    _last_log  = 0.0
+    _prev_seq  = -1
 
     while True:
         if not state["armed"] or state["setup_phase"] is not None:
@@ -596,19 +595,14 @@ def servo_tracking_loop():
             cur_seq = inference_seq
             dets    = list(latest_detections)
 
-        # Update freshness whenever inference produces a new result
-        if cur_seq != _prev_seq:
-            _prev_seq = cur_seq
-            if dets:
-                _last_inf_time = time.time()
-
-        # Stop if no fresh inference in 500ms
-        if time.time() - _last_inf_time > 0.4:
-            time.sleep(0.05); continue
+        # Only move on new inference result — prevents stale pixel coords causing overshoot
+        if cur_seq == _prev_seq:
+            time.sleep(0.02); continue
+        _prev_seq = cur_seq
 
         t = select_target(dets)
         if not t:
-            time.sleep(0.05); continue
+            continue
 
         rx    = state["reticle_x"]
         ry    = state["reticle_y"]
@@ -616,9 +610,9 @@ def servo_tracking_loop():
         err_y = t["cy"] - ry
 
         if abs(err_x) < 10 and abs(err_y) < 10:
-            time.sleep(0.05); continue
+            continue
 
-        MAX_STEP  = 1.5
+        MAX_STEP  = 3.0
         step_pan  = -np.sign(err_x) * min(MAX_STEP, abs(err_x) / 40.0 * MAX_STEP)
         step_tilt =  np.sign(err_y) * min(MAX_STEP, abs(err_y) / 40.0 * MAX_STEP)
 
@@ -636,7 +630,6 @@ def servo_tracking_loop():
                 f"tilt:{servo_angles['tilt']:.1f}->{new_tilt:.1f}")
 
         move_servos(new_pan, new_tilt)
-        time.sleep(0.05)
 
 def reticle_to_bbox_dist(rx, ry, det):
     """Shortest distance from reticle pixel to cat bounding box edge. 0 if inside."""
@@ -1819,7 +1812,8 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
                  oninput="document.getElementById('vl-s').textContent=parseFloat(this.value).toFixed(1)" onchange="updSettings()"></div>
         <div class="set"><label>Tolerance (px): <span class="vl" id="vl-t">20</span></label>
           <input type="range" min="5" max="100" step="5" value="20" id="on_target_tolerance"
-                 oninput="document.getElementById('vl-t').textContent=this.value;lastStatus.on_target_tolerance=parseInt(this.value)"></div>
+                 oninput="document.getElementById('vl-t').textContent=this.value;lastStatus.on_target_tolerance=parseInt(this.value)"
+                 onchange="updSettings()"></div>
         <div class="set"><label>Patrol Step (s): <span class="vl" id="vl-p">5</span></label>
           <input type="range" min="1" max="60" step="1" value="5" id="patrol_step_interval"
                  oninput="document.getElementById('vl-p').textContent=this.value" onchange="updSettings()"></div>
