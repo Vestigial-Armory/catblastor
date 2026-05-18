@@ -691,9 +691,19 @@ def firing_loop():
 
         # ── Solenoid ──────────────────────────────────────────────────────────
         rx = state["reticle_x"]; ry = state["reticle_y"]
-        on_target = t is not None and bool(
-            np.sqrt((t["cx"]-rx)**2 + (t["cy"]-ry)**2) <= state["on_target_tolerance"]
-        )
+        if t is not None:
+            # Centroid rect: 50% of bbox size centered on centroid
+            cr_hw = (t["x2"] - t["x1"]) * 0.25
+            cr_hh = (t["y2"] - t["y1"]) * 0.25
+            cr_x1 = t["cx"] - cr_hw; cr_x2 = t["cx"] + cr_hw
+            cr_y1 = t["cy"] - cr_hh; cr_y2 = t["cy"] + cr_hh
+            # Distance from reticle to centroid rect edge (0 if inside)
+            dx = max(cr_x1 - rx, 0, rx - cr_x2)
+            dy = max(cr_y1 - ry, 0, ry - cr_y2)
+            dist_to_centroid_rect = np.sqrt(dx*dx + dy*dy)
+            on_target = bool(dist_to_centroid_rect <= state["on_target_tolerance"])
+        else:
+            on_target = False
 
         solenoid_allowed = (
             any_detected and
@@ -2221,11 +2231,13 @@ function drawOvs(d){
       ctx.strokeRect(det.x1,det.y1,det.x2-det.x1,det.y2-det.y1);
       ctx.fillStyle=col;ctx.font='12px sans-serif';
       ctx.fillText('CAT'+(det.is_primary?' [TGT]':'')+' '+det.conf,det.x1,det.y1-4);
-      // Yellow hollow square at cat centroid (20x20px)
+      // Yellow hollow centroid rect at 50% of bbox size
       if(det.cx !== undefined && det.cy !== undefined){
+        const hw = (det.x2-det.x1)*0.25;  // half of 50% width
+        const hh = (det.y2-det.y1)*0.25;  // half of 50% height
         ctx.strokeStyle='#ffff00';ctx.lineWidth=2;
         ctx.setLineDash([]);
-        ctx.strokeRect(det.cx-10,det.cy-10,20,20);
+        ctx.strokeRect(det.cx-hw,det.cy-hh,hw*2,hh*2);
       }
     });
 
