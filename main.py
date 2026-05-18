@@ -248,15 +248,23 @@ def mjpeg_reader_loop():
                 with mjpeg_lock:
                     mjpeg_buffer = frame
                 buf = buf[e+2:]
-                # Write directly to recording process for true framerate
+                # Write to recording in a fire-and-forget thread — never block here
                 if recording["active"] and _rec_proc and _rec_proc.poll() is None:
-                    try:
-                        _rec_proc.stdin.write(frame)
-                        _rec_proc.stdin.flush()
-                    except Exception:
-                        pass
+                    f = frame  # capture ref
+                    threading.Thread(
+                        target=_write_rec_frame, args=(f,), daemon=True
+                    ).start()
         except Exception as ex:
             print(f"MJPEG reader: {ex}"); time.sleep(0.1)
+
+def _write_rec_frame(frame):
+    """Write one frame to ffmpeg stdin. Runs in its own thread so it can't block mjpeg_reader_loop."""
+    try:
+        if _rec_proc and _rec_proc.poll() is None:
+            _rec_proc.stdin.write(frame)
+            _rec_proc.stdin.flush()
+    except Exception as ex:
+        dbg(f"REC_WRITE_ERROR {ex}")
 
 # ─── GPIO ────────────────────────────────────────────────────────────────────
 GPIO.setmode(GPIO.BCM)
