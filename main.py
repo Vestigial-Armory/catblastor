@@ -19,7 +19,7 @@ from pathlib import Path
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 FRAME_W, FRAME_H = 640, 480
-INFER_W, INFER_H = 320, 240
+INFER_W, INFER_H = 160, 120
 PAN_CH, TILT_CH  = 0, 1
 PUMP_PIN, SOLENOID_PIN = 27, 17
 CAT_CLASS  = 15
