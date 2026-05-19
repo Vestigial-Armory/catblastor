@@ -287,19 +287,20 @@ state = {
     "reticle_x":FRAME_W//2,"reticle_y":FRAME_H//2,
     "target_class":15,
     "patrol_step_interval":5.0,
+    "pump_pretime":0.5,
 }
 if SETTINGS_FILE.exists():
     saved = json.loads(SETTINGS_FILE.read_text())
     for k in ["firing_mode","burst_length","reload_time","semi_auto_delay",
                "confidence_threshold","on_target_tolerance","target_class",
-               "patrol_step_interval"]:
+               "patrol_step_interval","pump_pretime"]:
         if k in saved: state[k] = saved[k]
 
 def save_settings():
     SETTINGS_FILE.write_text(json.dumps({k:state[k] for k in
         ["firing_mode","burst_length","reload_time","semi_auto_delay",
          "confidence_threshold","on_target_tolerance","target_class",
-         "patrol_step_interval"]}))
+         "patrol_step_interval","pump_pretime"]}))
 
 # Load persisted reticle position
 if RETICLE_FILE.exists():
@@ -1037,6 +1038,7 @@ async def status():
         "reload_time":state["reload_time"],
         "semi_auto_delay":state["semi_auto_delay"],
         "patrol_step_interval":state["patrol_step_interval"],
+        "pump_pretime":state["pump_pretime"],
     }
 
 @app.get("/setup_status")
@@ -1065,7 +1067,8 @@ async def setup_status():
 async def update_settings(request: Request):
     data = await request.json()
     old = {k:state[k] for k in ["firing_mode","burst_length","reload_time","semi_auto_delay",
-               "confidence_threshold","on_target_tolerance","target_class","patrol_step_interval"]}
+               "confidence_threshold","on_target_tolerance","target_class",
+               "patrol_step_interval","pump_pretime"]}
     for k in old:
         if k in data: state[k] = data[k]
     changed = {k:f"{old[k]}->{state[k]}" for k in old if old[k] != state[k]}
@@ -1433,13 +1436,13 @@ def _do_test_burst():
     global _manual_firing
     _manual_firing = True
     firing["active"] = True
-    log(f"TEST_FIRE burst={state['burst_length']}s")
+    log(f"TEST_FIRE burst={state['burst_length']}s pretime={state['pump_pretime']}s")
     set_pump(True)
-    time.sleep(0.5)
+    time.sleep(state["pump_pretime"])
     set_solenoid(True)
     time.sleep(state["burst_length"])
     set_solenoid(False)
-    time.sleep(0.5)
+    time.sleep(state["pump_pretime"])
     set_pump(False)
     firing["active"] = False
     _manual_firing = False
@@ -1547,11 +1550,11 @@ def _manual_fire():
     _manual_firing = True
     firing["active"] = True
     set_pump(True)
-    time.sleep(0.5)
+    time.sleep(state["pump_pretime"])
     set_solenoid(True)
     time.sleep(state["burst_length"])
     set_solenoid(False)
-    time.sleep(0.5)
+    time.sleep(state["pump_pretime"])
     set_pump(False)
     firing["active"] = False
     _manual_firing = False
@@ -1822,6 +1825,9 @@ select{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-r
         <div class="set"><label>Burst (s): <span class="vl" id="vl-b">1.0</span></label>
           <input type="range" min="0.1" max="5" step="0.1" value="1" id="burst_length"
                  oninput="document.getElementById('vl-b').textContent=parseFloat(this.value).toFixed(1)" onchange="updSettings()"></div>
+        <div class="set"><label>Pump Pre-fire (s): <span class="vl" id="vl-pp">0.5</span></label>
+          <input type="range" min="0" max="2" step="0.1" value="0.5" id="pump_pretime"
+                 oninput="document.getElementById('vl-pp').textContent=parseFloat(this.value).toFixed(1)" onchange="updSettings()"></div>
         <div class="set"><label>Reload (s): <span class="vl" id="vl-r">10</span></label>
           <input type="range" min="1" max="60" step="1" value="10" id="reload_time"
                  oninput="document.getElementById('vl-r').textContent=this.value" onchange="updSettings()"></div>
@@ -2499,6 +2505,7 @@ function saveSettings(){
       on_target_tolerance:parseInt(document.getElementById('on_target_tolerance').value),
       target_class:parseInt(document.getElementById('target_class').value)||15,
       patrol_step_interval:parseFloat(document.getElementById('patrol_step_interval').value),
+      pump_pretime:parseFloat(document.getElementById('pump_pretime').value),
     })}).then(r=>r.json()).then(()=>{
       const msg = document.getElementById('settings-saved-msg');
       msg.style.opacity='1';
@@ -2613,7 +2620,8 @@ function slowPoll(d){
     setSlider('reload_time',          d.reload_time,          'vl-r', null);
     setSlider('semi_auto_delay',      d.semi_auto_delay,      'vl-s', v=>parseFloat(v).toFixed(1));
     setSlider('on_target_tolerance',  d.on_target_tolerance,  'vl-t', null);
-    setSlider('patrol_step_interval', d.patrol_step_interval, 'vl-p', null);
+    setSlider('patrol_step_interval', d.patrol_step_interval, 'vl-p',  null);
+    setSlider('pump_pretime',         d.pump_pretime,         'vl-pp', v=>parseFloat(v).toFixed(1));
     const fm=document.getElementById('firing_mode');
     if(fm && d.firing_mode) fm.value=d.firing_mode;
     ['brightness','contrast','saturation','sharpness','ev','awb_gain_r','awb_gain_b'].forEach(k=>{
@@ -2664,6 +2672,7 @@ function updSettings(){
         on_target_tolerance:parseInt(document.getElementById('on_target_tolerance').value),
         target_class:parseInt(document.getElementById('target_class').value)||15,
         patrol_step_interval:parseFloat(document.getElementById('patrol_step_interval').value),
+        pump_pretime:parseFloat(document.getElementById('pump_pretime').value),
       })});
   }, 300);
 }
