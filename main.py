@@ -465,18 +465,27 @@ def capture_loop():
                 arr = np.frombuffer(fd, dtype=np.uint8)
                 f   = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if f is not None:
-                    f = cv2.resize(f, (INFER_W, INFER_H))
+                    f = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)  # Coral needs RGB
                     with frame_lock:
                         latest_frame = f.copy()
             except Exception:
                 pass
         time.sleep(1/3)
 
-def _inference_worker(frame_queue, result_queue, model_path, infer_w, infer_h, frame_w, frame_h):
-    """Runs in a separate process — has its own GIL, doesn't block main process."""
-    from ultralytics import YOLO
-    import numpy as np
-    model = YOLO(model_path)
+def _inference_worker(frame_queue, result_queue, model_path, frame_w, frame_h):
+    """Runs in a separate process using coral-env Python 3.9 + Edge TPU."""
+    import subprocess, pickle, sys, os
+
+    # Path to coral-env Python 3.9 interpreter
+    CORAL_PYTHON = os.path.expanduser("~/coral-env/bin/python3")
+    CORAL_SCRIPT = os.path.expanduser("~/catblastor/coral_infer.py")
+
+    # Start persistent coral inference subprocess
+    proc = subprocess.Popen(
+        [CORAL_PYTHON, CORAL_SCRIPT, model_path, str(frame_w), str(frame_h)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+
     while True:
         try:
             item = frame_queue.get(timeout=1.0)
@@ -486,20 +495,23 @@ def _inference_worker(frame_queue, result_queue, model_path, infer_w, infer_h, f
             break
         frame, target_class, confidence_threshold = item
         try:
-            results = model(frame, verbose=False)
-            sx, sy  = frame_w / infer_w, frame_h / infer_h
-            dets = []
-            for r in results[0].boxes:
-                cls  = int(r.cls); conf = float(r.conf)
-                if cls == target_class and conf >= confidence_threshold:
-                    x1,y1,x2,y2 = map(int, r.xyxy[0])
-                    x1,y1,x2,y2 = int(x1*sx),int(y1*sy),int(x2*sx),int(y2*sy)
-                    cx,cy = (x1+x2)//2,(y1+y2)//2
-                    dets.append({"id":f"{cx}_{cy}","x1":x1,"y1":y1,"x2":x2,"y2":y2,
-                                 "cx":cx,"cy":cy,"conf":conf,"in_zone":False})
+            # Send frame + params as pickle to coral_infer.py
+            payload = pickle.dumps((frame, target_class, confidence_threshold))
+            length  = len(payload).to_bytes(4, 'big')
+            proc.stdin.write(length + payload)
+            proc.stdin.flush()
+            # Read result
+            rlen = int.from_bytes(proc.stdout.read(4), 'big')
+            dets = pickle.loads(proc.stdout.read(rlen))
             result_queue.put(dets)
         except Exception as e:
             result_queue.put([])
+            # Restart subprocess if it died
+            if proc.poll() is not None:
+                proc = subprocess.Popen(
+                    [CORAL_PYTHON, CORAL_SCRIPT, model_path, str(frame_w), str(frame_h)],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
 
 # Set up inference queues and process
 _inf_frame_q  = mp.Queue(maxsize=1)
@@ -508,10 +520,10 @@ _inf_process  = None
 
 def start_inference_process():
     global _inf_process
+    model_path = str(BASE_DIR / "coral_model" / "ssd_mobilenet_v2_coco_quant_postprocess_edgetpu.tflite")
     _inf_process = mp.Process(
         target=_inference_worker,
-        args=(_inf_frame_q, _inf_result_q,
-              "yolov8n_ncnn_model", INFER_W, INFER_H, FRAME_W, FRAME_H),
+        args=(_inf_frame_q, _inf_result_q, model_path, FRAME_W, FRAME_H),
         daemon=True
     )
     _inf_process.start()
